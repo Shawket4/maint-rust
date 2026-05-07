@@ -11,6 +11,7 @@ pub enum ApiError {
     Unauthorized(String),
 
     #[error("forbidden: {0}")]
+    #[allow(dead_code)]
     Forbidden(String),
 
     #[error("not found: {0}")]
@@ -48,6 +49,7 @@ pub enum ApiError {
     Reqwest(#[from] reqwest::Error),
 
     #[error("internal error: {0}")]
+    #[allow(dead_code)]
     Internal(String),
 
     #[error(transparent)]

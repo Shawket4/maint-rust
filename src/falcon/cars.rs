@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -10,12 +9,7 @@ use crate::error::ApiResult;
 pub const FALCON_CARS_PATH: &str = "/api/cars";
 pub const CACHE_KEY_CARS: &str = "falcon:cars";
 
-#[derive(Serialize)]
-pub struct CarsCacheResponse {
-    pub vehicles: Vec<Value>,
-    pub drivers: Vec<Value>,
-    pub fetched_at: DateTime<Utc>,
-}
+
 
 /// Fetch cars from Falcon (cached for `ttl_seconds`).
 ///

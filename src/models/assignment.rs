@@ -39,6 +39,7 @@ pub struct AssignmentRow {
 
 #[derive(Debug, Deserialize)]
 pub struct MountInput {
+    #[allow(dead_code)]
     pub id: Option<Uuid>,
     pub position_id: Uuid,
     pub mounted_at: DateTime<Utc>,

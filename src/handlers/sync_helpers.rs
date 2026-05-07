@@ -157,7 +157,7 @@ pub async fn update_from_payload(
 
     let mut sets: Vec<String> = Vec::new();
     for col in cols {
-        if col == pk {
+        if *col == pk {
             continue;
         }
         if !payload.get(col).is_some() {

@@ -3,7 +3,7 @@
 //! 4-character WWYY string. WW ∈ [01,53], YY ∈ [00,99] → year = 2000 + YY.
 //! production_date = ISO Monday of week WW year YYYY, ≤ today.
 
-use chrono::{Datelike, NaiveDate, Utc, Weekday};
+use chrono::{NaiveDate, Utc, Weekday};
 
 #[derive(Debug)]
 pub enum DotParseError {
@@ -79,6 +79,7 @@ pub fn validate_week_year(week: Option<i16>, year: Option<i16>) -> Result<(), Do
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     #[test]
     fn parses_4523() {

@@ -1,0 +1,183 @@
+name: Build and Deploy Rust App
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build in Docker (Ubuntu 22.04 - matches VPS)
+        env:
+          SQLX_OFFLINE: true
+        run: |
+          cat > Dockerfile.build << 'EOF'
+          FROM ubuntu:22.04
+
+          ENV DEBIAN_FRONTEND=noninteractive
+
+          # libssl-dev is still required by sqlx and other crates at compile time
+          RUN apt-get update && apt-get install -y \
+              curl \
+              build-essential \
+              pkg-config \
+              libssl-dev \
+              ca-certificates \
+              && rm -rf /var/lib/apt/lists/*
+
+          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          ENV PATH="/root/.cargo/bin:${PATH}"
+
+          WORKDIR /app
+
+          COPY . .
+
+          RUN cargo build --release --verbose
+
+          RUN strip target/release/maint-rust || true
+
+          RUN ls -lh target/release/maint-rust
+          EOF
+
+          docker build -t maint-rust-builder -f Dockerfile.build .
+
+          docker create --name temp-container maint-rust-builder
+          docker cp temp-container:/app/target/release/maint-rust ./maint-rust
+          docker rm temp-container
+
+          ls -la maint-rust
+          file maint-rust
+
+          chmod +x maint-rust
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deployment
+
+          cp maint-rust deployment/
+          cp -r migrations deployment/ || true
+          cp .env.example deployment/.env.example || true
+
+          tar -czf deployment.tar.gz -C deployment .
+
+          echo "Deployment package contents:"
+          tar -tzf deployment.tar.gz
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy to VPS
+        run: |
+          cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          DEPLOY_DIR="/opt/maint-rust"
+          SERVICE_NAME="maint-rust"
+          BACKUP_DIR="/opt/maint-rust/backups"
+
+          echo "Starting deployment..."
+
+          sudo mkdir -p ${DEPLOY_DIR}
+          sudo mkdir -p ${BACKUP_DIR}
+          sudo mkdir -p ${DEPLOY_DIR}/logs
+
+          echo "Stopping service..."
+          sudo systemctl stop ${SERVICE_NAME} || true
+
+          if [ -f ${DEPLOY_DIR}/maint-rust ]; then
+            echo "Backing up existing binary..."
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            sudo cp ${DEPLOY_DIR}/maint-rust ${BACKUP_DIR}/maint-rust.${TIMESTAMP}
+            sudo ls -t ${BACKUP_DIR}/maint-rust.* | tail -n +6 | xargs -r sudo rm
+          fi
+
+          echo "Extracting new files..."
+          cd ${DEPLOY_DIR}
+          sudo tar -xzf /tmp/deployment.tar.gz
+
+          echo "Files in deployment directory:"
+          ls -la ${DEPLOY_DIR}/
+
+          sudo chmod +x ${DEPLOY_DIR}/maint-rust
+          sudo chown -R root:root ${DEPLOY_DIR}
+
+          if [ ! -f ${DEPLOY_DIR}/.env ] && [ -f ${DEPLOY_DIR}/.env.example ]; then
+            echo "Creating .env from .env.example..."
+            sudo cp ${DEPLOY_DIR}/.env.example ${DEPLOY_DIR}/.env
+            echo "⚠️  Please configure ${DEPLOY_DIR}/.env with your settings"
+          fi
+
+          if [ -d ${DEPLOY_DIR}/migrations ]; then
+            echo "Migrations directory found. Run manually if needed:"
+            echo "cd ${DEPLOY_DIR} && sqlx migrate run"
+          fi
+
+          echo "Restarting service..."
+          sudo systemctl daemon-reload
+          sudo systemctl enable ${SERVICE_NAME}
+          sudo systemctl restart ${SERVICE_NAME}
+
+          sleep 3
+
+          echo "Checking service status..."
+          if sudo systemctl is-active --quiet ${SERVICE_NAME}; then
+            echo "✅ Service is running"
+            sudo systemctl status ${SERVICE_NAME} --no-pager
+          else
+            echo "❌ Service failed to start"
+            echo "Last 20 log lines:"
+            sudo journalctl -u ${SERVICE_NAME} -n 20 --no-pager
+            exit 1
+          fi
+
+          echo "Deployment completed successfully!"
+          EOF
+
+          chmod +x deploy.sh
+
+          echo "Uploading deployment package..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} deployment.tar.gz ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
+
+          echo "Deploying on VPS..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} deploy.sh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "bash /tmp/deploy.sh"
+
+      - name: Health check
+        run: |
+          echo "Waiting for service to be ready..."
+          sleep 5
+
+          # Service is HTTP-only on loopback — no TLS, no -k flag needed
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "curl -f http://127.0.0.1:8090/api/maint/health || echo 'Health check endpoint not available'"
+
+      - name: Verify deployment
+        run: |
+          echo "Verifying service status..."
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "systemctl status maint-rust --no-pager" || true
+
+      - name: Show recent logs
+        if: always()
+        run: |
+          echo "Recent service logs:"
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo journalctl -u maint-rust -n 30 --no-pager" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+          echo "Cleaned up SSH keys"

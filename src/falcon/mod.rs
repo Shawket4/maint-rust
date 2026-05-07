@@ -4,5 +4,5 @@ pub mod cars;
 pub mod client;
 pub mod invoices;
 
-pub use cache::{CacheManager, CACHE_PREFIX};
+pub use cache::CacheManager;
 pub use client::FalconClient;

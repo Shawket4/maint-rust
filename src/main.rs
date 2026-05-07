@@ -53,8 +53,8 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         falcon,
         cache,
-        falcon_cars_ttl: cfg.falcon_cars_ttl,
-        falcon_invoices_ttl: cfg.falcon_invoices_ttl,
+        falcon_cars_ttl: cfg.falcon_cars_cache_ttl,
+        falcon_invoices_ttl: cfg.falcon_invoices_cache_ttl,
     };
 
     let bind = (cfg.bind_addr.clone(), cfg.port);

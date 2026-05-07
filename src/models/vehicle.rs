@@ -4,6 +4,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 
 #[derive(Debug, Serialize, FromRow)]
+#[allow(dead_code)]
 pub struct VehicleCacheRow {
     pub id: i32,
     pub car_no_plate: String,

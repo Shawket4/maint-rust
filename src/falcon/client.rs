@@ -22,10 +22,6 @@ impl FalconClient {
         Self { inner, base_url }
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
     fn auth_headers(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}")) {
@@ -62,43 +58,6 @@ impl FalconClient {
             });
         }
         let v = resp.json::<serde_json::Value>().await?;
-        Ok(v)
-    }
-
-    pub async fn post_json(
-        &self,
-        path: &str,
-        token: &str,
-        body: &serde_json::Value,
-    ) -> ApiResult<serde_json::Value> {
-        let url = format!("{}{}", self.base_url, path);
-        let resp = self
-            .inner
-            .post(&url)
-            .headers(Self::auth_headers(token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ApiError::UpstreamTimeout
-                } else {
-                    ApiError::Reqwest(e)
-                }
-            })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::UpstreamFalcon {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        let v = resp
-            .json::<serde_json::Value>()
-            .await
-            .unwrap_or(serde_json::json!({}));
         Ok(v)
     }
 }

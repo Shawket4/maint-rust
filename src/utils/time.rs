@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Africa::Cairo;
 

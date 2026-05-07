@@ -78,15 +78,6 @@ impl CacheManager {
         Ok(())
     }
 
-    pub async fn delete(&self, suffix: &str) -> ApiResult<()> {
-        let mut mgr = match self.inner.clone() {
-            Some(m) => m,
-            None => return Ok(()),
-        };
-        let _: Result<(), _> = mgr.del(Self::key(suffix)).await;
-        Ok(())
-    }
-
     /// Delete all keys matching `maint:<pattern>`. Used for invalidation.
     pub async fn delete_pattern(&self, pattern_suffix: &str) -> ApiResult<()> {
         let mut mgr = match self.inner.clone() {

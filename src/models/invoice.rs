@@ -3,6 +3,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 
 #[derive(Debug, Serialize, FromRow)]
+#[allow(dead_code)]
 pub struct ServiceInvoiceCacheRow {
     pub id: i32,
     pub car_id: i32,

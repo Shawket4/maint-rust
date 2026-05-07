@@ -11,7 +11,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
-use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 
@@ -340,8 +339,4 @@ pub async fn pull_rows(
         next_cursor,
         has_more,
     })
-}
-
-pub fn parse_uuid(s: &str) -> ApiResult<Uuid> {
-    Uuid::parse_str(s).map_err(|e| ApiError::BadRequest(format!("invalid UUID: {e}")))
 }
