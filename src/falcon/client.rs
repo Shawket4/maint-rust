@@ -1,4 +1,4 @@
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
 use reqwest::Client;
 use std::time::Duration;
 
@@ -24,8 +24,8 @@ impl FalconClient {
 
     fn auth_headers(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}")) {
-            h.insert(AUTHORIZATION, v);
+        if let Ok(v) = HeaderValue::from_str(&format!("jwt={token}")) {
+            h.insert(COOKIE, v);
         }
         h
     }

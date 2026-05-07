@@ -829,10 +829,9 @@ async fn dismount_handler(
     })))
 }
 
-pub fn routes() -> Scope {
+pub fn configure(cfg: &mut web::ServiceConfig) {
     // Bulk path must register before the parameterized /tires/{id} so it isn't shadowed.
-    web::scope("")
-        .service(tires_bulk)
+    cfg.service(tires_bulk)
         .service(mount_handler)
         .service(dismount_handler)
         .service(create_tire)
@@ -840,5 +839,5 @@ pub fn routes() -> Scope {
         .service(tire_history)
         .service(get_tire)
         .service(update_tire)
-        .service(delete_tire)
+        .service(delete_tire);
 }

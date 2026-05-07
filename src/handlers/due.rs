@@ -69,6 +69,6 @@ async fn list_due(
     Ok(HttpResponse::Ok().json(rows))
 }
 
-pub fn routes() -> Scope {
-    web::scope("").service(list_due)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(list_due);
 }

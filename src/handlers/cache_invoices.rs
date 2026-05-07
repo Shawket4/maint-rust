@@ -101,11 +101,10 @@ async fn search_invoices_handler(
     Ok(HttpResponse::Ok().json(v))
 }
 
-pub fn routes() -> Scope {
+pub fn configure(cfg: &mut web::ServiceConfig) {
     // Order matters: more-specific paths must register before less-specific ones,
     // otherwise actix's path matcher will route /sync to the parameterized handler.
-    web::scope("")
-        .service(sync_invoices)
+    cfg.service(sync_invoices)
         .service(search_invoices_handler)
-        .service(get_invoices)
+        .service(get_invoices);
 }

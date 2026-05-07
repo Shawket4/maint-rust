@@ -71,20 +71,20 @@ async fn main() -> anyhow::Result<()> {
             .wrap(Cors::permissive())
             .service(
                 web::scope("/api/maint")
-                    .service(handlers::health::routes())
+                    .configure(handlers::health::configure)
                     .service(
                         web::scope("")
                             .wrap(auth_mw)
-                            .service(handlers::cache_vehicles::routes())
-                            .service(handlers::cache_invoices::routes())
-                            .service(handlers::templates::routes())
-                            .service(handlers::records::routes())
-                            .service(handlers::due::routes())
-                            .service(handlers::overrides::routes())
-                            .service(handlers::chassis::routes())
-                            .service(handlers::tires::routes())
-                            .service(handlers::assignments::routes())
-                            .service(handlers::sync::routes()),
+                            .configure(handlers::cache_vehicles::configure)
+                            .configure(handlers::cache_invoices::configure)
+                            .configure(handlers::templates::configure)
+                            .configure(handlers::records::configure)
+                            .configure(handlers::due::configure)
+                            .configure(handlers::overrides::configure)
+                            .configure(handlers::chassis::configure)
+                            .configure(handlers::tires::configure)
+                            .configure(handlers::assignments::configure)
+                            .configure(handlers::sync::configure),
                     ),
             )
     })

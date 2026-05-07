@@ -644,9 +644,8 @@ async fn chassis_full(
     })))
 }
 
-pub fn routes() -> Scope {
-    web::scope("")
-        .service(create_layout)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(create_layout)
         .service(list_layouts)
         .service(get_layout)
         .service(update_layout)
@@ -658,5 +657,5 @@ pub fn routes() -> Scope {
         .service(create_spare)
         .service(list_positions)
         .service(delete_position)
-        .service(chassis_full)
+        .service(chassis_full);
 }

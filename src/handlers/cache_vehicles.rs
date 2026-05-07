@@ -36,6 +36,6 @@ async fn get_cache_vehicles(
     })))
 }
 
-pub fn routes() -> Scope {
-    web::scope("").service(get_cache_vehicles)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(get_cache_vehicles);
 }

@@ -374,11 +374,10 @@ async fn delete_record(
     Ok(HttpResponse::NoContent().finish())
 }
 
-pub fn routes() -> Scope {
-    web::scope("")
-        .service(create_record)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(create_record)
         .service(list_records)
         .service(get_record)
         .service(update_record)
-        .service(delete_record)
+        .service(delete_record);
 }

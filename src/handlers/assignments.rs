@@ -57,6 +57,6 @@ async fn list_assignments(
     Ok(HttpResponse::Ok().json(rows))
 }
 
-pub fn routes() -> Scope {
-    web::scope("").service(list_assignments)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(list_assignments);
 }

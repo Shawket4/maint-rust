@@ -41,6 +41,6 @@ async fn sync_pull(
     Ok(HttpResponse::Ok().json(resp))
 }
 
-pub fn routes() -> Scope {
-    web::scope("").service(sync_push).service(sync_pull)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(sync_push).service(sync_pull);
 }

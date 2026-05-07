@@ -21,6 +21,6 @@ async fn health(pool: web::Data<PgPool>) -> HttpResponse {
     }
 }
 
-pub fn routes() -> Scope {
-    web::scope("").service(health)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(health);
 }

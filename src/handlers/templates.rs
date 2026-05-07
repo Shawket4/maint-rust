@@ -301,11 +301,10 @@ async fn delete_template(
     Ok(HttpResponse::NoContent().finish())
 }
 
-pub fn routes() -> Scope {
-    web::scope("")
-        .service(create_template)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(create_template)
         .service(list_templates)
         .service(get_template)
         .service(update_template)
-        .service(delete_template)
+        .service(delete_template);
 }

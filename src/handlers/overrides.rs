@@ -118,9 +118,8 @@ async fn delete_override(
     Ok(HttpResponse::NoContent().finish())
 }
 
-pub fn routes() -> Scope {
-    web::scope("")
-        .service(upsert_override)
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(upsert_override)
         .service(get_override)
-        .service(delete_override)
+        .service(delete_override);
 }
