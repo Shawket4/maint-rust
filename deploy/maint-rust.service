@@ -1,0 +1,37 @@
+[Unit]
+Description=maint-rust — Apex Maintenance API
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=apex
+Group=apex
+WorkingDirectory=/opt/maint-rust
+ExecStart=/opt/maint-rust/maint-rust
+EnvironmentFile=/opt/maint-rust/.env
+Restart=on-failure
+RestartSec=3s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/maint-rust
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=maint-rust
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

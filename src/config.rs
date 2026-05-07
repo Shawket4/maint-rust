@@ -1,0 +1,42 @@
+use anyhow::{Context, Result};
+use std::env;
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub database_url: String,
+    pub redis_url: Option<String>,
+    pub jwt_secret: String,
+    pub falcon_base_url: String,
+    pub port: u16,
+    pub bind_addr: String,
+    pub falcon_cars_cache_ttl: u64,
+    pub falcon_invoices_cache_ttl: u64,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        // dotenvy is best-effort — if .env doesn't exist (prod/systemd) we don't fail.
+        let _ = dotenvy::dotenv();
+
+        Ok(Self {
+            database_url: env::var("DATABASE_URL").context("DATABASE_URL must be set")?,
+            redis_url: env::var("REDIS_URL").ok(),
+            jwt_secret: env::var("JWT_SECRET").context("JWT_SECRET must be set")?,
+            falcon_base_url: env::var("FALCON_BASE_URL")
+                .unwrap_or_else(|_| "https://apextransport.ddns.net/api/go".to_string()),
+            port: env::var("PORT")
+                .unwrap_or_else(|_| "8090".to_string())
+                .parse()
+                .context("PORT must be a u16")?,
+            bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            falcon_cars_cache_ttl: env::var("FALCON_CARS_CACHE_TTL")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30),
+            falcon_invoices_cache_ttl: env::var("FALCON_INVOICES_CACHE_TTL")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30),
+        })
+    }
+}
