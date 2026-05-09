@@ -75,6 +75,16 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (EntityType::Tires, "parent_tire_id") => "::uuid",
         (EntityType::TireAssignments, "tire_id") => "::uuid",
         (EntityType::TireAssignments, "position_id") => "::uuid",
+        // Integer columns
+        (_, "vehicle_id") | (_, "odometer") | (_, "odometer_at_service") |
+        (_, "next_due_km") | (_, "interval_km") | (_, "interval_days") |
+        (_, "lead_warn_km") | (_, "lead_warn_days") | (_, "section_index") |
+        (_, "spare_index") | (_, "mounted_odometer") | (_, "dismounted_odometer") |
+        (_, "production_week") | (_, "production_year") | (_, "retread_count") => "::integer",
+        // Numeric/Decimal columns
+        (_, "cost") | (_, "purchase_cost") => "::numeric",
+        // Date columns
+        (_, "purchase_date") | (_, "production_date") | (_, "scrap_date") => "::date",
         // JSONB columns use the value-as-jsonb extraction below; no cast needed
         _ => "",
     }
