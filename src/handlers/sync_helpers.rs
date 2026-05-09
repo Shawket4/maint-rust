@@ -85,6 +85,9 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (_, "cost") | (_, "purchase_cost") => "::numeric",
         // Date columns
         (_, "purchase_date") | (_, "production_date") | (_, "scrap_date") => "::date",
+        // Timestamptz columns
+        (_, "set_at") | (_, "performed_at") | (_, "next_due_at") |
+        (_, "mounted_at") | (_, "dismounted_at") => "::timestamptz",
         // JSONB columns use the value-as-jsonb extraction below; no cast needed
         _ => "",
     }
