@@ -12,10 +12,13 @@ pub const FALCON_INVOICE_SEARCH_PATH: &str = "/api/service-invoices/search";
 fn cache_key_invoices(page: u32, limit: u32) -> String {
     format!("falcon:invoices:p{page}:l{limit}")
 }
-fn cache_key_search(query: &str, page: u32, limit: u32) -> String {
+fn cache_key_search(query: &str, car_id: Option<i32>, page: u32, limit: u32) -> String {
     // Simple sanitization — colons and whitespace would mangle the keyspace
     let q = query.replace([':', ' ', '\n', '\r', '\t'], "_");
-    format!("falcon:invoices:search:{q}:p{page}:l{limit}")
+    match car_id {
+        Some(cid) => format!("falcon:invoices:search:{q}:c{cid}:p{page}:l{limit}"),
+        None => format!("falcon:invoices:search:{q}:p{page}:l{limit}"),
+    }
 }
 
 pub async fn fetch_invoices_cached(
@@ -41,16 +44,21 @@ pub async fn search_invoices(
     cache: &CacheManager,
     token: &str,
     query: &str,
+    car_id: Option<i32>,
     page: u32,
     limit: u32,
     ttl_seconds: u64,
 ) -> ApiResult<Value> {
-    let key = cache_key_search(query, page, limit);
+    let key = cache_key_search(query, car_id, page, limit);
     if let Some(hit) = cache.get_json::<Value>(&key).await? {
         return Ok(hit);
     }
     let qenc = urlencoding(query);
-    let path = format!("{FALCON_INVOICE_SEARCH_PATH}?query={qenc}&page={page}&limit={limit}");
+    let mut path = format!("{FALCON_INVOICE_SEARCH_PATH}?query={qenc}&page={page}&limit={limit}");
+    if let Some(cid) = car_id {
+        use std::fmt::Write;
+        write!(&mut path, "&car_id={cid}").unwrap();
+    }
     let v = falcon.get_json(&path, token).await?;
     // Search results have shorter TTL because they're query-dependent and rare
     cache.set_json(&key, &v, ttl_seconds.min(15)).await?;

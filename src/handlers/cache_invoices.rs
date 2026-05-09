@@ -76,6 +76,7 @@ async fn sync_invoices(
 #[derive(Deserialize)]
 struct SearchQuery {
     query: String,
+    car_id: Option<i32>,
     #[serde(default = "default_page")]
     page: u32,
     #[serde(default = "default_limit")]
@@ -93,6 +94,7 @@ async fn search_invoices_handler(
         &state.cache,
         &token.0,
         &q.query,
+        q.car_id,
         q.page,
         q.limit,
         state.falcon_invoices_ttl,
