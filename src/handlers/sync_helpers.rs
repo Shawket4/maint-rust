@@ -88,6 +88,9 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         // Timestamptz columns
         (_, "set_at") | (_, "performed_at") | (_, "next_due_at") |
         (_, "mounted_at") | (_, "dismounted_at") => "::timestamptz",
+        // Boolean columns
+        (_, "is_active") | (_, "is_steering") | (_, "is_lifted") |
+        (_, "is_spare") | (_, "is_retread") => "::boolean",
         // JSONB columns use the value-as-jsonb extraction below; no cast needed
         _ => "",
     }
