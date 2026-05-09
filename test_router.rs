@@ -10,6 +10,7 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().body("health ok")
 }
 
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
