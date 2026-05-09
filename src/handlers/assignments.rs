@@ -2,7 +2,7 @@
 //! live at /tires/{id}/mount and /tires/assignments/{id}/dismount per §9.4).
 //! This module exists for §10 layout symmetry and to expose a list endpoint.
 
-use actix_web::{get, web, HttpResponse, Scope};
+use actix_web::{get, web, HttpResponse};
 use uuid::Uuid;
 
 use crate::db::PgPool;

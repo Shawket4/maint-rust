@@ -1,4 +1,4 @@
-use actix_web::{delete, get, post, put, web, HttpResponse, Scope};
+use actix_web::{delete, get, post, put, web, HttpResponse};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

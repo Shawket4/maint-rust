@@ -1,4 +1,4 @@
-use actix_web::{get, post, web, HttpResponse, Scope};
+use actix_web::{get, post, web, HttpResponse};
 use chrono::{TimeZone, Utc};
 
 use crate::auth::AuthClaims;

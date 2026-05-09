@@ -1,4 +1,4 @@
-use actix_web::{get, web, HttpResponse, Scope};
+use actix_web::{get, web, HttpResponse};
 use serde_json::json;
 use sqlx::PgPool;
 

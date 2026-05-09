@@ -47,7 +47,10 @@ pub fn project_vehicles_and_drivers(raw: &Value) -> (Vec<Value>, Vec<Value>) {
     for car in &arr {
         // Drop nested driver into separate list, deduped by id.
         if let Some(d) = car.get("driver") {
-            if let Some(id) = d.get("id").and_then(|v| v.as_i64()) {
+            let id = d.get("ID").and_then(|v| v.as_i64()).or_else(|| {
+                d.get("id").and_then(|v| v.as_i64())
+            });
+            if let Some(id) = id {
                 if id != 0 {
                     drivers_by_id.entry(id).or_insert_with(|| d.clone());
                 }

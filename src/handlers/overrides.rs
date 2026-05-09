@@ -1,4 +1,4 @@
-use actix_web::{delete, get, put, web, HttpResponse, Scope};
+use actix_web::{delete, get, put, web, HttpResponse};
 
 use crate::auth::AuthClaims;
 use crate::db::PgPool;
