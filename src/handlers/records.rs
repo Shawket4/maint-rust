@@ -18,9 +18,9 @@ async fn create_record(
     body: web::Json<CreateRecordInput>,
 ) -> ApiResult<HttpResponse> {
     let inp = body.into_inner();
-    if inp.performed_at > Utc::now() {
+    if inp.performed_at > Utc::now() + chrono::Duration::minutes(5) {
         return Err(ApiError::BadRequest(
-            "performed_at must be <= now()".into(),
+            "performed_at cannot be in the future".into(),
         ));
     }
 
@@ -195,8 +195,8 @@ async fn update_record(
     }
 
     let new_performed_at = upd.performed_at.unwrap_or(current.performed_at);
-    if new_performed_at > Utc::now() {
-        return Err(ApiError::BadRequest("performed_at must be <= now()".into()));
+    if new_performed_at > Utc::now() + chrono::Duration::minutes(5) {
+        return Err(ApiError::BadRequest("performed_at cannot be in the future".into()));
     }
     let new_odo = match upd.odometer_at_service {
         Some(opt) => opt,
