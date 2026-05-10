@@ -26,6 +26,10 @@ pub struct MaintenanceRecordRow {
     pub created_by_user_id: i64,
     pub updated_by_user_id: i64,
     pub sync_version: i64,
+    // UI fields from join
+    pub name_ar: Option<String>,
+    pub name_en: Option<String>,
+    pub category_icon: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +84,7 @@ pub struct DueRow {
     pub current_odometer: i32,
     pub odometer_source: String,
     pub status: String,
+    pub category_icon: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

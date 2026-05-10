@@ -33,6 +33,10 @@ pub struct MaintenanceTemplateRow {
     pub created_by_user_id: i64,
     pub updated_by_user_id: i64,
     pub sync_version: i64,
+    // UI fields from join
+    pub category_name_ar: Option<String>,
+    pub category_name_en: Option<String>,
+    pub category_icon: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
