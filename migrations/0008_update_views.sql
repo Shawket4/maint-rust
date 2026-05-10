@@ -3,7 +3,8 @@
 -- =========================================================
 
 -- 1. Update v_maintenance_due
-CREATE OR REPLACE VIEW v_maintenance_due AS
+DROP VIEW IF EXISTS v_maintenance_due;
+CREATE VIEW v_maintenance_due AS
 SELECT
     t.id              AS template_id,
     t.vehicle_id,
@@ -57,7 +58,8 @@ WHERE t.deleted_at IS NULL
   AND vc.source_deleted_at IS NULL;
 
 -- 2. Create v_maintenance_records
-CREATE OR REPLACE VIEW v_maintenance_records AS
+DROP VIEW IF EXISTS v_maintenance_records;
+CREATE VIEW v_maintenance_records AS
 SELECT
     r.*,
     vc.car_no_plate AS plate_number
@@ -65,7 +67,8 @@ FROM maintenance_records r
 JOIN vehicles_cache vc ON vc.id = r.vehicle_id;
 
 -- 3. Create v_maintenance_templates
-CREATE OR REPLACE VIEW v_maintenance_templates AS
+DROP VIEW IF EXISTS v_maintenance_templates;
+CREATE VIEW v_maintenance_templates AS
 SELECT
     t.*,
     vc.car_no_plate AS plate_number
