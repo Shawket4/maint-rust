@@ -15,6 +15,7 @@ pub enum MaintenanceTrigger {
 pub struct MaintenanceTemplateRow {
     pub id: Uuid,
     pub vehicle_id: i32,
+    #[sqlx(default)]
     pub plate_number: Option<String>,
     pub category_id: String,
     pub name_ar: String,
@@ -34,8 +35,11 @@ pub struct MaintenanceTemplateRow {
     pub updated_by_user_id: i64,
     pub sync_version: i64,
     // UI fields from join
+    #[sqlx(default)]
     pub category_name_ar: Option<String>,
+    #[sqlx(default)]
     pub category_name_en: Option<String>,
+    #[sqlx(default)]
     pub category_icon: Option<String>,
 }
 

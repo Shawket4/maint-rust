@@ -9,6 +9,7 @@ pub struct MaintenanceRecordRow {
     pub id: Uuid,
     pub template_id: Option<Uuid>,
     pub vehicle_id: i32,
+    #[sqlx(default)]
     pub plate_number: Option<String>,
     pub category_id: String,
     pub performed_at: DateTime<Utc>,
@@ -27,8 +28,11 @@ pub struct MaintenanceRecordRow {
     pub updated_by_user_id: i64,
     pub sync_version: i64,
     // UI fields from join
+    #[sqlx(default)]
     pub name_ar: Option<String>,
+    #[sqlx(default)]
     pub name_en: Option<String>,
+    #[sqlx(default)]
     pub category_icon: Option<String>,
 }
 
@@ -68,6 +72,7 @@ pub struct UpdateRecordInput {
 pub struct DueRow {
     pub template_id: Uuid,
     pub vehicle_id: i32,
+    #[sqlx(default)]
     pub plate_number: Option<String>,
     pub category_id: String,
     pub name_ar: String,
@@ -84,6 +89,7 @@ pub struct DueRow {
     pub current_odometer: i32,
     pub odometer_source: String,
     pub status: String,
+    #[sqlx(default)]
     pub category_icon: Option<String>,
 }
 
