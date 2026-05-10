@@ -15,7 +15,7 @@ pub enum MaintenanceTrigger {
 pub struct MaintenanceTemplateRow {
     pub id: Uuid,
     pub vehicle_id: i32,
-    pub plate_number: String,
+    pub plate_number: Option<String>,
     pub category_id: String,
     pub name_ar: String,
     pub name_en: String,

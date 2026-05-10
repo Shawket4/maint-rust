@@ -9,7 +9,7 @@ pub struct MaintenanceRecordRow {
     pub id: Uuid,
     pub template_id: Option<Uuid>,
     pub vehicle_id: i32,
-    pub plate_number: String,
+    pub plate_number: Option<String>,
     pub category_id: String,
     pub performed_at: DateTime<Utc>,
     pub odometer_at_service: Option<i32>,
@@ -68,7 +68,7 @@ pub struct UpdateRecordInput {
 pub struct DueRow {
     pub template_id: Uuid,
     pub vehicle_id: i32,
-    pub plate_number: String,
+    pub plate_number: Option<String>,
     pub category_id: String,
     pub name_ar: String,
     pub name_en: String,
