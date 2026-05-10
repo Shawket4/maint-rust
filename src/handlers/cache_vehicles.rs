@@ -21,11 +21,11 @@ async fn get_cache_vehicles(
         state.falcon_cars_ttl,
     )
     .await?;
-    let (vehicles, drivers) = project_vehicles_and_drivers(&raw);
+    let (mut vehicles, drivers) = project_vehicles_and_drivers(&raw);
 
     // Mirror into Postgres for the LATERAL joins in views (vehicles_cache).
     // Best-effort: if DB write fails, we still respond from Falcon.
-    if let Err(e) = upsert_cars_into_cache(&state.pool, &vehicles, &drivers).await {
+    if let Err(e) = upsert_cars_into_cache(&state.pool, &mut vehicles, &drivers).await {
         tracing::warn!(error = %e, "failed to upsert vehicles into cache");
     }
 

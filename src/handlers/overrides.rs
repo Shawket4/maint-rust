@@ -77,6 +77,20 @@ async fn upsert_override(
     .fetch_one(&mut *tx)
     .await?;
 
+    // Propagate the override to the vehicles_cache immediately if it's greater than current.
+    // This ensures real-time updates for the UI and due-engine without waiting for next Falcon sync.
+    sqlx::query(
+        r#"
+        UPDATE vehicles_cache
+           SET mileage = GREATEST(COALESCE(mileage, 0), $1)
+         WHERE id = $2
+        "#,
+    )
+    .bind(inp.odometer)
+    .bind(vehicle_id)
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
     Ok(HttpResponse::Ok().json(row))
 }
