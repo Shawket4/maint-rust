@@ -127,6 +127,7 @@ pub async fn upsert_cars_into_cache(
             .get("last_oil_change_id")
             .and_then(|x| x.as_i64())
             .map(|x| x as i32);
+        let mileage = v.get("mileage").and_then(|x| x.as_i64()).map(|x| x as i32);
         let driver_id = v.get("driver_id").and_then(|x| x.as_i64()).map(|x| x as i32);
         let operating_company = v
             .get("operating_company")
@@ -169,7 +170,7 @@ pub async fn upsert_cars_into_cache(
                 id, car_no_plate, car_type, transporter, tank_capacity, json_compartments,
                 license_expiration_date, calibration_expiration_date, tank_license_expiration_date,
                 is_in_trip, is_approved, location, lat, long, location_time_stamp,
-                engine_status, speed, last_fuel_odometer, last_oil_change_id, driver_id,
+                engine_status, speed, last_fuel_odometer, last_oil_change_id, mileage, driver_id,
                 operating_company, operating_area, geo_fence, slack_status, last_updated_slack_status,
                 etit_car_id, car_license_url, car_license_back_url,
                 calibration_license_url, calibration_license_back_url,
@@ -177,7 +178,7 @@ pub async fn upsert_cars_into_cache(
                 raw_payload, source_deleted_at, fetched_at
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,NULL, now()
+                $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,NULL, now()
             )
             ON CONFLICT (id) DO UPDATE SET
                 car_no_plate = EXCLUDED.car_no_plate,
@@ -198,6 +199,7 @@ pub async fn upsert_cars_into_cache(
                 speed = EXCLUDED.speed,
                 last_fuel_odometer = EXCLUDED.last_fuel_odometer,
                 last_oil_change_id = EXCLUDED.last_oil_change_id,
+                mileage = EXCLUDED.mileage,
                 driver_id = EXCLUDED.driver_id,
                 operating_company = EXCLUDED.operating_company,
                 operating_area = EXCLUDED.operating_area,
@@ -235,6 +237,7 @@ pub async fn upsert_cars_into_cache(
         .bind(speed)
         .bind(last_fuel_odometer)
         .bind(last_oil_change_id)
+        .bind(mileage)
         .bind(driver_id)
         .bind(operating_company)
         .bind(operating_area)

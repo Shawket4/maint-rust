@@ -25,6 +25,7 @@ pub struct VehicleCacheRow {
     pub speed: Option<i32>,
     pub last_fuel_odometer: Option<i32>,
     pub last_oil_change_id: Option<i32>,
+    pub mileage: Option<i32>,
     pub driver_id: Option<i32>,
     pub operating_company: Option<String>,
     pub operating_area: Option<String>,

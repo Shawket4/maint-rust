@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS vehicles_cache (
     speed                           INT,
     last_fuel_odometer              INT,
     last_oil_change_id              INT,
+    mileage                         INT,
     driver_id                       INT,
     operating_company               TEXT,
     operating_area                  TEXT,
@@ -383,11 +384,12 @@ SELECT
     r.next_due_at,
     r.next_due_km,
     GREATEST(
+        COALESCE(vc.mileage, 0),
         COALESCE(vc.last_fuel_odometer, 0),
         COALESCE(voo.odometer, 0)
     ) AS current_odometer,
     CASE
-        WHEN COALESCE(voo.odometer, 0) > COALESCE(vc.last_fuel_odometer, 0)
+        WHEN COALESCE(voo.odometer, 0) > GREATEST(COALESCE(vc.mileage, 0), COALESCE(vc.last_fuel_odometer, 0))
             THEN 'manual'
         ELSE 'falcon'
     END AS odometer_source,
@@ -395,9 +397,9 @@ SELECT
       WHEN r.id IS NULL THEN 'never_done'
       WHEN t.trigger_type = 'mileage' AND r.next_due_km IS NOT NULL THEN
         CASE
-          WHEN GREATEST(COALESCE(vc.last_fuel_odometer, 0), COALESCE(voo.odometer, 0)) >= r.next_due_km
+          WHEN GREATEST(COALESCE(vc.mileage, 0), COALESCE(vc.last_fuel_odometer, 0), COALESCE(voo.odometer, 0)) >= r.next_due_km
             THEN 'overdue'
-          WHEN GREATEST(COALESCE(vc.last_fuel_odometer, 0), COALESCE(voo.odometer, 0)) >= r.next_due_km - t.lead_warn_km
+          WHEN GREATEST(COALESCE(vc.mileage, 0), COALESCE(vc.last_fuel_odometer, 0), COALESCE(voo.odometer, 0)) >= r.next_due_km - t.lead_warn_km
             THEN 'due_soon'
           ELSE 'ok'
         END
