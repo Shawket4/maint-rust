@@ -137,9 +137,21 @@ pub async fn insert_from_payload(
 
     let cols_sql = col_list.join(", ");
     let vals_sql = value_exprs.join(", ");
-    let q = format!(
-        "INSERT INTO {table} ({cols_sql}) VALUES ({vals_sql}) RETURNING sync_version"
+    let mut q = format!(
+        "INSERT INTO {table} ({cols_sql}) VALUES ({vals_sql})"
     );
+    if entity == EntityType::VehicleOdometerOverrides {
+        q.push_str(" ON CONFLICT (vehicle_id) DO UPDATE SET ");
+        let mut updates = Vec::new();
+        for col in col_list.iter() {
+            if *col == "vehicle_id" { continue; }
+            updates.push(format!("{col} = EXCLUDED.{col}"));
+        }
+        updates.push("updated_at = now()".to_string());
+        updates.push("sync_version = vehicle_odometer_overrides.sync_version + 1".to_string());
+        q.push_str(&updates.join(", "));
+    }
+    q.push_str(" RETURNING sync_version");
     let (sv,): (i64,) = sqlx::query_as(&q)
         .bind(payload)
         .bind(user_id)

@@ -139,7 +139,7 @@ pub async fn apply_push_operation(
 
     match op.operation {
         SyncOperation::Insert => {
-            if row_now.is_some() {
+            if row_now.is_some() && op.entity_type != EntityType::VehicleOdometerOverrides {
                 // Idempotent insert: if sync_version matches, treat as no-op applied.
                 let server_sv = row_now
                     .as_ref()
