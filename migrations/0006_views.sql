@@ -5,6 +5,7 @@ CREATE OR REPLACE VIEW v_maintenance_due AS
 SELECT
     t.id              AS template_id,
     t.vehicle_id,
+    vc.car_no_plate    AS plate_number,
     t.category_id,
     t.name_ar, t.name_en,
     t.trigger_type,
@@ -139,3 +140,23 @@ SELECT
 FROM tires t
 LEFT JOIN v_tire_lifetime tl ON tl.tire_id = t.id
 WHERE t.deleted_at IS NULL;
+
+-- =========================================================
+-- v_maintenance_records: history with vehicle details
+-- =========================================================
+CREATE OR REPLACE VIEW v_maintenance_records AS
+SELECT
+    r.*,
+    vc.car_no_plate AS plate_number
+FROM maintenance_records r
+JOIN vehicles_cache vc ON vc.id = r.vehicle_id;
+
+-- =========================================================
+-- v_maintenance_templates: templates with vehicle details
+-- =========================================================
+CREATE OR REPLACE VIEW v_maintenance_templates AS
+SELECT
+    t.*,
+    vc.car_no_plate AS plate_number
+FROM maintenance_templates t
+JOIN vehicles_cache vc ON vc.id = t.vehicle_id;

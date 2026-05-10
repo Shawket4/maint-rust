@@ -49,7 +49,7 @@ async fn create_record(
     };
 
     let id = inp.id.unwrap_or_else(Uuid::new_v4);
-    let row: MaintenanceRecordRow = sqlx::query_as(
+    sqlx::query(
         r#"
         INSERT INTO maintenance_records (
             id, template_id, vehicle_id, category_id,
@@ -60,7 +60,6 @@ async fn create_record(
         ) VALUES (
             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14
         )
-        RETURNING *
         "#,
     )
     .bind(id)
@@ -77,8 +76,13 @@ async fn create_record(
     .bind(&inp.notes)
     .bind(&inp.attachments)
     .bind(claims.user_id)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
+
+    let row: MaintenanceRecordRow = sqlx::query_as("SELECT * FROM v_maintenance_records WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     tx.commit().await?;
     Ok(HttpResponse::Created().json(row))
@@ -98,7 +102,7 @@ async fn list_records(
     let rows: Vec<MaintenanceRecordRow> = match (q.vehicle_id, q.template_id) {
         (Some(vid), Some(tid)) => {
             sqlx::query_as(
-                r#"SELECT * FROM maintenance_records
+                r#"SELECT * FROM v_maintenance_records
                    WHERE deleted_at IS NULL AND vehicle_id = $1 AND template_id = $2
                    ORDER BY performed_at DESC LIMIT 1000"#,
             )
@@ -109,7 +113,7 @@ async fn list_records(
         }
         (Some(vid), None) => {
             sqlx::query_as(
-                r#"SELECT * FROM maintenance_records
+                r#"SELECT * FROM v_maintenance_records
                    WHERE deleted_at IS NULL AND vehicle_id = $1
                    ORDER BY performed_at DESC LIMIT 1000"#,
             )
@@ -119,7 +123,7 @@ async fn list_records(
         }
         (None, Some(tid)) => {
             sqlx::query_as(
-                r#"SELECT * FROM maintenance_records
+                r#"SELECT * FROM v_maintenance_records
                    WHERE deleted_at IS NULL AND template_id = $1
                    ORDER BY performed_at DESC LIMIT 1000"#,
             )
@@ -129,7 +133,7 @@ async fn list_records(
         }
         (None, None) => {
             sqlx::query_as(
-                r#"SELECT * FROM maintenance_records
+                r#"SELECT * FROM v_maintenance_records
                    WHERE deleted_at IS NULL
                    ORDER BY performed_at DESC LIMIT 1000"#,
             )
@@ -147,7 +151,7 @@ async fn get_record(
 ) -> ApiResult<HttpResponse> {
     let id = path.into_inner();
     let row: Option<MaintenanceRecordRow> = sqlx::query_as(
-        "SELECT * FROM maintenance_records WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT * FROM v_maintenance_records WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(pool.get_ref())
@@ -229,7 +233,7 @@ async fn update_record(
         (current.next_due_km, current.next_due_at)
     };
 
-    let updated: MaintenanceRecordRow = sqlx::query_as(
+    sqlx::query(
         r#"
         UPDATE maintenance_records SET
             performed_at = $1,
@@ -245,7 +249,6 @@ async fn update_record(
             updated_by_user_id = $10,
             sync_version = sync_version + 1
         WHERE id = $11
-        RETURNING *
         "#,
     )
     .bind(new_performed_at)
@@ -259,8 +262,13 @@ async fn update_record(
     .bind(new_attachments)
     .bind(claims.user_id)
     .bind(id)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
+
+    let updated: MaintenanceRecordRow = sqlx::query_as("SELECT * FROM v_maintenance_records WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     // Side effect: if this update made another record the latest, recompute on that one.
     if let Some(tid) = updated.template_id {

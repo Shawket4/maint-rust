@@ -64,7 +64,7 @@ async fn create_template(
     validate_trigger(inp.trigger_type, inp.interval_km, inp.interval_days)?;
 
     let id = inp.id.unwrap_or_else(Uuid::new_v4);
-    let row: MaintenanceTemplateRow = sqlx::query_as(
+    sqlx::query(
         r#"
         INSERT INTO maintenance_templates (
             id, vehicle_id, category_id, name_ar, name_en, notes_ar, notes_en,
@@ -74,7 +74,6 @@ async fn create_template(
         ) VALUES (
             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14
         )
-        RETURNING *
         "#,
     )
     .bind(id)
@@ -91,8 +90,13 @@ async fn create_template(
     .bind(inp.lead_warn_days)
     .bind(inp.is_active)
     .bind(claims.user_id)
-    .fetch_one(pool.get_ref())
+    .execute(pool.get_ref())
     .await?;
+
+    let row: MaintenanceTemplateRow = sqlx::query_as("SELECT * FROM v_maintenance_templates WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool.get_ref())
+        .await?;
 
     Ok(HttpResponse::Created().json(row))
 }
@@ -105,7 +109,7 @@ async fn list_templates(
     let rows: Vec<MaintenanceTemplateRow> = match q.vehicle_id {
         Some(vid) => {
             sqlx::query_as(
-                r#"SELECT * FROM maintenance_templates
+                r#"SELECT * FROM v_maintenance_templates
                    WHERE deleted_at IS NULL AND vehicle_id = $1
                    ORDER BY created_at DESC"#,
             )
@@ -115,7 +119,7 @@ async fn list_templates(
         }
         None => {
             sqlx::query_as(
-                r#"SELECT * FROM maintenance_templates
+                r#"SELECT * FROM v_maintenance_templates
                    WHERE deleted_at IS NULL
                    ORDER BY created_at DESC LIMIT 1000"#,
             )
@@ -138,7 +142,7 @@ async fn get_template(
 ) -> ApiResult<HttpResponse> {
     let id = path.into_inner();
     let row: Option<MaintenanceTemplateRow> = sqlx::query_as(
-        "SELECT * FROM maintenance_templates WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT * FROM v_maintenance_templates WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(pool.get_ref())
@@ -208,7 +212,7 @@ async fn update_template(
     let new_lead_warn_days = upd.lead_warn_days.unwrap_or(current.lead_warn_days);
     let new_is_active = upd.is_active.unwrap_or(current.is_active);
 
-    let updated: MaintenanceTemplateRow = sqlx::query_as(
+    sqlx::query(
         r#"
         UPDATE maintenance_templates SET
             name_ar = $1,
@@ -225,7 +229,6 @@ async fn update_template(
             updated_by_user_id = $11,
             sync_version = sync_version + 1
         WHERE id = $12
-        RETURNING *
         "#,
     )
     .bind(new_name_ar)
@@ -240,8 +243,13 @@ async fn update_template(
     .bind(new_is_active)
     .bind(claims.user_id)
     .bind(id)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
+
+    let updated: MaintenanceTemplateRow = sqlx::query_as("SELECT * FROM v_maintenance_templates WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     // Side effect: recompute next_due_* on the latest record for this template.
     let latest: Option<MaintenanceRecordRow> = sqlx::query_as(
