@@ -10,7 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Acquire, PgPool, Postgres, Transaction};
 
 use crate::error::{ApiError, ApiResult};
 
@@ -102,6 +102,14 @@ pub struct PullQuery {
     /// ISO-8601 timestamp; default = epoch.
     #[serde(default)]
     pub since: Option<DateTime<Utc>>,
+    /// PK (as text) of the last row of the previous page. Together with `since`
+    /// this forms a composite keyset cursor — REQUIRED for correct paging,
+    /// because rows written in one transaction share a byte-identical
+    /// updated_at (Postgres now() is transaction_timestamp()), and a
+    /// timestamp-only `>` cursor silently skips the remainder of such a group
+    /// at every page boundary.
+    #[serde(default)]
+    pub after_id: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
 }
@@ -114,10 +122,60 @@ fn default_limit() -> i64 {
 pub struct PullResponse {
     pub entity_type: EntityType,
     pub rows: Vec<Value>,
-    /// Max(updated_at) across returned rows; client uses this as their next cursor.
+    /// updated_at of the last returned row; pass back as `since`.
     /// Null when rows is empty.
     pub next_cursor: Option<DateTime<Utc>>,
+    /// PK (text) of the last returned row; pass back as `after_id`.
+    pub next_cursor_id: Option<String>,
     pub has_more: bool,
+}
+
+/// Apply a whole push batch: one outer transaction, one SAVEPOINT per operation.
+///
+/// The savepoints are the load-bearing part. Without them, the first statement
+/// that trips a Postgres constraint aborts the surrounding transaction (25P02):
+/// the per-op `Error` result was produced, but every LATER statement in the
+/// batch then failed with "current transaction is aborted" and the client got
+/// one opaque 500 instead of per-op results. Unique violations were worse —
+/// they map to ApiError::Conflict, which propagated and rolled back the entire
+/// batch. With a savepoint around each op, a failed op rolls back only itself
+/// and the batch keeps its promise: independent per-op results.
+pub async fn apply_push_batch(
+    pool: &PgPool,
+    body: &PushBody,
+    user_id: i64,
+) -> ApiResult<PushResponse> {
+    let mut tx = pool.begin().await?;
+    let mut results = Vec::with_capacity(body.operations.len());
+    for op in &body.operations {
+        // sqlx: Transaction::begin on a &mut Transaction issues a SAVEPOINT.
+        let mut sp = tx.begin().await?;
+        match apply_push_operation(&mut sp, op, user_id).await {
+            Ok(r) => {
+                // Commit ONLY when the op applied. A per-op Error is often a
+                // constraint violation that apply_push_operation swallowed into
+                // a result — the subtransaction is already aborted underneath,
+                // and RELEASE SAVEPOINT on an aborted subtransaction is itself
+                // a 25P02. Rolling back Error/Conflict discards nothing (those
+                // paths wrote nothing durable) and always leaves the outer
+                // transaction healthy.
+                match &r {
+                    PushResultStatus::Applied { .. } => sp.commit().await?,
+                    _ => sp.rollback().await?,
+                }
+                results.push(r);
+            }
+            Err(e) => {
+                sp.rollback().await?;
+                results.push(PushResultStatus::Error {
+                    entity_id: op.entity_id.clone(),
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(PushResponse { results })
 }
 
 /// Apply a single push operation inside an existing transaction.
@@ -307,36 +365,55 @@ async fn soft_delete(
     Ok(sv)
 }
 
-/// Cursor-based incremental pull.
+/// Cursor-based incremental pull with a composite (updated_at, pk) keyset.
+///
+/// All rows are returned, including soft-deleted ones (clients need tombstones).
 pub async fn pull_rows(
     pool: &PgPool,
     entity: EntityType,
     since: DateTime<Utc>,
+    after_id: Option<&str>,
     limit: i64,
 ) -> ApiResult<PullResponse> {
     let table = entity.table_name();
-    // We return all rows including deleted ones (clients need to know about deletes).
-    // Order by updated_at then PK to make cursor advancement well-defined.
     let pk = entity.pk_column();
-    let q = format!(
-        r#"
-        SELECT to_jsonb(t) AS row, updated_at
-          FROM {table} t
-         WHERE updated_at > $1
-         ORDER BY updated_at ASC, {pk}::text ASC
-         LIMIT $2
-        "#
-    );
-    let rows: Vec<(Value, DateTime<Utc>)> =
-        sqlx::query_as(&q).bind(since).bind(limit).fetch_all(pool).await?;
 
-    let next_cursor = rows.last().map(|(_, t)| *t);
+    // Row-value comparison makes the keyset exact: strictly after the last row
+    // we handed out, even when many rows share one updated_at. Without
+    // after_id (first page) a plain > on the timestamp is correct.
+    let rows: Vec<(Value, DateTime<Utc>, String)> = if let Some(aid) = after_id {
+        let q = format!(
+            r#"
+            SELECT to_jsonb(t) AS row, updated_at, {pk}::text AS pk_text
+              FROM {table} t
+             WHERE (updated_at, {pk}::text) > ($1, $2)
+             ORDER BY updated_at ASC, {pk}::text ASC
+             LIMIT $3
+            "#
+        );
+        sqlx::query_as(&q).bind(since).bind(aid).bind(limit).fetch_all(pool).await?
+    } else {
+        let q = format!(
+            r#"
+            SELECT to_jsonb(t) AS row, updated_at, {pk}::text AS pk_text
+              FROM {table} t
+             WHERE updated_at > $1
+             ORDER BY updated_at ASC, {pk}::text ASC
+             LIMIT $2
+            "#
+        );
+        sqlx::query_as(&q).bind(since).bind(limit).fetch_all(pool).await?
+    };
+
+    let next_cursor = rows.last().map(|(_, t, _)| *t);
+    let next_cursor_id = rows.last().map(|(_, _, id)| id.clone());
     let has_more = rows.len() as i64 == limit;
 
     Ok(PullResponse {
         entity_type: entity,
-        rows: rows.into_iter().map(|(v, _)| v).collect(),
+        rows: rows.into_iter().map(|(v, _, _)| v).collect(),
         next_cursor,
+        next_cursor_id,
         has_more,
     })
 }

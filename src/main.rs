@@ -4,20 +4,12 @@ use anyhow::Context;
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod auth;
-mod config;
-mod db;
-mod error;
-mod falcon;
-mod handlers;
-mod models;
-mod services;
-mod utils;
+use maint_rust::{auth, config, db, falcon, handlers};
 
-use crate::auth::JwtAuth;
-use crate::config::Config;
-use crate::falcon::{CacheManager, FalconClient};
-use crate::handlers::AppState;
+use auth::JwtAuth;
+use config::Config;
+use falcon::{CacheManager, FalconClient};
+use handlers::AppState;
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
