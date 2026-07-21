@@ -13,6 +13,7 @@ use crate::auth::AuthClaims;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::handlers::AppState;
+use crate::services::stock_ledger;
 
 /// Mirror Falcon's authoritative tire ledger into tire_stock_cache, then return it (§4).
 #[get("/stock/tires")]
@@ -82,46 +83,32 @@ async fn debit_stock(
     let ref_uuid = uuid::Uuid::parse_str(&d.ref_id)
         .map_err(|_| ApiError::BadRequest("ref_id must be a uuid".into()))?;
 
+    let kind: &'static str = match d.kind.as_str() {
+        "tire_debit" => "tire_debit",
+        "oil_debit" => "oil_debit",
+        other => {
+            return Err(ApiError::BadRequest(format!("unknown debit kind: {other}")));
+        }
+    };
+    let spec = stock_ledger::DebitSpec {
+        kind,
+        brand: d.brand,
+        model: d.model,
+        size: d.size,
+        oil_type: d.oil_type,
+        qty: d.qty,
+        liters: d.liters,
+        ref_id: ref_uuid,
+        work_order_id: d.work_order_id.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
+    };
+
     // Local movement + cache decrement (idempotent on ref_id).
     let mut tx = state.pool.begin().await?;
-    let exists: Option<(uuid::Uuid,)> =
-        sqlx::query_as("SELECT id FROM stock_movements WHERE ref_id = $1")
-            .bind(ref_uuid).fetch_optional(&mut *tx).await?;
-    if exists.is_none() {
-        let kind_sql = d.kind.as_str();
-        sqlx::query(
-            "INSERT INTO stock_movements (kind, brand, model, size, oil_type, qty, liters, work_order_id, ref_id) \
-             VALUES ($1::stock_move_kind,$2,$3,$4,$5,$6,$7,$8,$9)",
-        )
-        .bind(kind_sql).bind(&d.brand).bind(&d.model).bind(&d.size).bind(&d.oil_type)
-        .bind(d.qty).bind(d.liters)
-        .bind(d.work_order_id.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok()))
-        .bind(ref_uuid)
-        .execute(&mut *tx).await?;
-        if d.kind == "tire_debit" {
-            sqlx::query("UPDATE tire_stock_cache SET on_hand_qty = on_hand_qty - $1 WHERE brand=$2 AND model=COALESCE($3,'') AND size=COALESCE($4,'')")
-                .bind(d.qty.unwrap_or(0)).bind(&d.brand).bind(&d.model).bind(&d.size).execute(&mut *tx).await?;
-        } else if d.kind == "oil_debit" {
-            sqlx::query("UPDATE oil_stock_cache SET liters_on_hand = liters_on_hand - $1 WHERE oil_type=$2")
-                .bind(d.liters.unwrap_or(0.0)).bind(&d.oil_type).execute(&mut *tx).await?;
-        }
-    }
+    stock_ledger::record_debit(&mut tx, &spec).await?;
     tx.commit().await?;
 
     // Push up to Falcon (best-effort; idempotent on ref_id upstream).
-    let payload = json!({
-        "kind": d.kind, "brand": d.brand, "model": d.model, "size": d.size,
-        "oil_type": d.oil_type, "qty": d.qty, "liters": d.liters,
-        "ref_id": d.ref_id, "work_order_id": d.work_order_id,
-    });
-    match state.falcon.post_json("/api/maint-stock/debit", &token.0, &payload).await {
-        Ok((200, _)) => {
-            let _ = sqlx::query("UPDATE stock_movements SET mirrored_to_falcon_at = now() WHERE ref_id = $1")
-                .bind(ref_uuid).execute(&state.pool).await;
-        }
-        Ok((s, _)) => tracing::warn!(status = s, "falcon debit non-200 (will reconcile later)"),
-        Err(e) => tracing::warn!(error = %e, "falcon debit push failed (offline; reconcile later)"),
-    }
+    stock_ledger::mirror_debits(&state, &token.0, &[ref_uuid]).await;
     Ok(HttpResponse::Ok().json(json!({"ok": true})))
 }
 

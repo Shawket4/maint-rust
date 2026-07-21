@@ -11,8 +11,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
+use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::services::side_effects;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -155,14 +157,17 @@ pub async fn apply_push_batch(
     pool: &PgPool,
     body: &PushBody,
     user_id: i64,
-) -> ApiResult<PushResponse> {
+) -> ApiResult<(PushResponse, Vec<Uuid>)> {
     let mut tx = pool.begin().await?;
     let mut results = Vec::with_capacity(body.operations.len());
+    // Stock movements recorded by side effects; mirrored to Falcon by the
+    // caller AFTER the outer transaction commits (never network inside a txn).
+    let mut debit_refs: Vec<Uuid> = Vec::new();
     for op in &body.operations {
         // sqlx: Transaction::begin on a &mut Transaction issues a SAVEPOINT.
         let mut sp = tx.begin().await?;
         match apply_push_operation(&mut sp, op, user_id).await {
-            Ok(r) => {
+            Ok((r, refs)) => {
                 // Commit ONLY when the op applied. A per-op Error is often a
                 // constraint violation that apply_push_operation swallowed into
                 // a result — the subtransaction is already aborted underneath,
@@ -171,7 +176,10 @@ pub async fn apply_push_batch(
                 // paths wrote nothing durable) and always leaves the outer
                 // transaction healthy.
                 match &r {
-                    PushResultStatus::Applied { .. } => sp.commit().await?,
+                    PushResultStatus::Applied { .. } => {
+                        sp.commit().await?;
+                        debit_refs.extend(refs);
+                    }
                     _ => sp.rollback().await?,
                 }
                 results.push(r);
@@ -186,7 +194,7 @@ pub async fn apply_push_batch(
         }
     }
     tx.commit().await?;
-    Ok(PushResponse { results })
+    Ok((PushResponse { results }, debit_refs))
 }
 
 /// Apply a single push operation inside an existing transaction.
@@ -198,7 +206,7 @@ pub async fn apply_push_operation(
     tx: &mut Transaction<'_, Postgres>,
     op: &PushOperation,
     user_id: i64,
-) -> ApiResult<PushResultStatus> {
+) -> ApiResult<(PushResultStatus, Vec<Uuid>)> {
     let table = op.entity_type.table_name();
     let pk = op.entity_type.pk_column();
 
@@ -206,36 +214,62 @@ pub async fn apply_push_operation(
     // writers don't race us.
     let row_now = fetch_row_json(tx, table, pk, &op.entity_id).await?;
 
+    let no_refs: Vec<Uuid> = Vec::new();
     match op.operation {
         SyncOperation::Insert => {
             if row_now.is_some() && !op.entity_type.upserts_on_conflict() {
-                // Idempotent insert: if sync_version matches, treat as no-op applied.
+                // Idempotent insert: if sync_version matches, treat as no-op
+                // applied. Side effects do NOT re-run — the original apply
+                // already recorded them (and debits dedupe on ref_id anyway).
+                //
+                // The (0, 1) case is the lost-ack replay: clients send inserts
+                // with sync_version 0, the row lands at DEFAULT 1, and the
+                // redelivered insert must ack as a no-op — not manufacture a
+                // conflict dead-letter for a write that succeeded.
                 let server_sv = row_now
                     .as_ref()
                     .and_then(|v| v.get("sync_version"))
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
-                if op.sync_version == server_sv {
-                    return Ok(PushResultStatus::Applied {
-                        entity_id: op.entity_id.clone(),
-                        new_sync_version: server_sv,
-                    });
+                if op.sync_version == server_sv || (op.sync_version == 0 && server_sv == 1) {
+                    return Ok((
+                        PushResultStatus::Applied {
+                            entity_id: op.entity_id.clone(),
+                            new_sync_version: server_sv,
+                        },
+                        no_refs,
+                    ));
                 }
-                return Ok(PushResultStatus::Conflict {
-                    entity_id: op.entity_id.clone(),
-                    server_row: row_now.unwrap_or(Value::Null),
-                });
+                return Ok((
+                    PushResultStatus::Conflict {
+                        entity_id: op.entity_id.clone(),
+                        server_row: row_now.unwrap_or(Value::Null),
+                    },
+                    no_refs,
+                ));
             }
+            // Server-owned derived fields (e.g. the oil flag) override the client.
+            let mut payload = op.payload.clone();
+            side_effects::normalize_insert(op.entity_type, &mut payload);
             // Build column list from payload, force audit columns server-side.
-            match generic_insert(tx, op.entity_type, &op.payload, user_id).await {
-                Ok(new_sv) => Ok(PushResultStatus::Applied {
-                    entity_id: op.entity_id.clone(),
-                    new_sync_version: new_sv,
-                }),
-                Err(ApiError::BadRequest(m)) => Ok(PushResultStatus::Error {
-                    entity_id: op.entity_id.clone(),
-                    message: m,
-                }),
+            match generic_insert(tx, op.entity_type, &payload, user_id).await {
+                Ok(new_sv) => {
+                    let refs = side_effects::after_apply(tx, op, &payload, None).await?;
+                    Ok((
+                        PushResultStatus::Applied {
+                            entity_id: op.entity_id.clone(),
+                            new_sync_version: new_sv,
+                        },
+                        refs,
+                    ))
+                }
+                Err(ApiError::BadRequest(m)) => Ok((
+                    PushResultStatus::Error {
+                        entity_id: op.entity_id.clone(),
+                        message: m,
+                    },
+                    no_refs,
+                )),
                 Err(e) => Err(e),
             }
         }
@@ -243,10 +277,13 @@ pub async fn apply_push_operation(
             let row_now = match row_now {
                 Some(r) => r,
                 None => {
-                    return Ok(PushResultStatus::Error {
-                        entity_id: op.entity_id.clone(),
-                        message: "row not found".into(),
-                    });
+                    return Ok((
+                        PushResultStatus::Error {
+                            entity_id: op.entity_id.clone(),
+                            message: "row not found".into(),
+                        },
+                        no_refs,
+                    ));
                 }
             };
             let server_sv = row_now
@@ -254,20 +291,33 @@ pub async fn apply_push_operation(
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             if server_sv != op.sync_version {
-                return Ok(PushResultStatus::Conflict {
-                    entity_id: op.entity_id.clone(),
-                    server_row: row_now,
-                });
+                return Ok((
+                    PushResultStatus::Conflict {
+                        entity_id: op.entity_id.clone(),
+                        server_row: row_now,
+                    },
+                    no_refs,
+                ));
             }
             match generic_update(tx, op.entity_type, &op.entity_id, &op.payload, user_id).await {
-                Ok(new_sv) => Ok(PushResultStatus::Applied {
-                    entity_id: op.entity_id.clone(),
-                    new_sync_version: new_sv,
-                }),
-                Err(ApiError::BadRequest(m)) => Ok(PushResultStatus::Error {
-                    entity_id: op.entity_id.clone(),
-                    message: m,
-                }),
+                Ok(new_sv) => {
+                    let refs =
+                        side_effects::after_apply(tx, op, &op.payload, Some(&row_now)).await?;
+                    Ok((
+                        PushResultStatus::Applied {
+                            entity_id: op.entity_id.clone(),
+                            new_sync_version: new_sv,
+                        },
+                        refs,
+                    ))
+                }
+                Err(ApiError::BadRequest(m)) => Ok((
+                    PushResultStatus::Error {
+                        entity_id: op.entity_id.clone(),
+                        message: m,
+                    },
+                    no_refs,
+                )),
                 Err(e) => Err(e),
             }
         }
@@ -276,10 +326,13 @@ pub async fn apply_push_operation(
                 Some(r) => r,
                 None => {
                     // Already gone — treat as applied for idempotency.
-                    return Ok(PushResultStatus::Applied {
-                        entity_id: op.entity_id.clone(),
-                        new_sync_version: op.sync_version,
-                    });
+                    return Ok((
+                        PushResultStatus::Applied {
+                            entity_id: op.entity_id.clone(),
+                            new_sync_version: op.sync_version,
+                        },
+                        no_refs,
+                    ));
                 }
             };
             let server_sv = row_now
@@ -287,23 +340,32 @@ pub async fn apply_push_operation(
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             if server_sv != op.sync_version {
-                return Ok(PushResultStatus::Conflict {
-                    entity_id: op.entity_id.clone(),
-                    server_row: row_now,
-                });
+                return Ok((
+                    PushResultStatus::Conflict {
+                        entity_id: op.entity_id.clone(),
+                        server_row: row_now,
+                    },
+                    no_refs,
+                ));
             }
             // Soft delete only; vehicle_odometer_overrides has no deleted_at.
             if op.entity_type == EntityType::VehicleOdometerOverrides {
-                return Ok(PushResultStatus::Error {
-                    entity_id: op.entity_id.clone(),
-                    message: "vehicle_odometer_overrides does not support delete".into(),
-                });
+                return Ok((
+                    PushResultStatus::Error {
+                        entity_id: op.entity_id.clone(),
+                        message: "vehicle_odometer_overrides does not support delete".into(),
+                    },
+                    no_refs,
+                ));
             }
             let new_sv = soft_delete(tx, op.entity_type, &op.entity_id, user_id).await?;
-            Ok(PushResultStatus::Applied {
-                entity_id: op.entity_id.clone(),
-                new_sync_version: new_sv,
-            })
+            Ok((
+                PushResultStatus::Applied {
+                    entity_id: op.entity_id.clone(),
+                    new_sync_version: new_sv,
+                },
+                no_refs,
+            ))
         }
     }
 }
