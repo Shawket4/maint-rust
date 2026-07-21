@@ -68,6 +68,12 @@ fn wo_op(id: Uuid, status: &str) -> PushOperation {
     )
 }
 
+/// A unique vehicle id per run — chassis_layouts.vehicle_id is UNIQUE, so a
+/// fixed id would break the second `cargo test` against the same database.
+fn fresh_vehicle_id() -> i64 {
+    10_000 + (Uuid::new_v4().as_u128() % 1_000_000) as i64
+}
+
 /// Direct-SQL chassis fixture: layout + one axle + one road position (+ optionally a spare).
 async fn seed_chassis(pool: &PgPool, vehicle_id: i64) -> (Uuid, Uuid) {
     let layout = Uuid::new_v4();
@@ -140,7 +146,8 @@ async fn push_batch_survives_per_op_failure_mid_batch() {
 #[tokio::test]
 async fn double_mount_on_position_errors_per_op_and_first_survives() {
     let Some(pool) = test_pool().await else { return };
-    let (_layout, pos) = seed_chassis(&pool, 902).await;
+    let vid = fresh_vehicle_id();
+    let (_layout, pos) = seed_chassis(&pool, vid).await;
 
     let mk_tire = |id: Uuid| {
         insert_op(
@@ -162,7 +169,7 @@ async fn double_mount_on_position_errors_per_op_and_first_survives() {
                 "id": id.to_string(),
                 "tire_id": tire.to_string(),
                 "position_id": pos.to_string(),
-                "vehicle_id": 902,
+                "vehicle_id": vid,
                 "mounted_at": chrono::Utc::now().to_rfc3339(),
                 "mounted_odometer": 100_000,
                 "mount_reason": "new",
@@ -342,7 +349,8 @@ async fn oil_change_debits_ledger_once_and_server_owns_the_flag() {
 #[tokio::test]
 async fn mount_from_shipment_debits_stock_and_dismount_derives_status_and_km() {
     let Some(pool) = test_pool().await else { return };
-    let (_layout, pos) = seed_chassis(&pool, 903).await;
+    let vid = fresh_vehicle_id();
+    let (_layout, pos) = seed_chassis(&pool, vid).await;
 
     let brand = format!("B-{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query(
@@ -377,7 +385,7 @@ async fn mount_from_shipment_debits_stock_and_dismount_derives_status_and_km() {
                     "id": asg.to_string(),
                     "tire_id": tire.to_string(),
                     "position_id": pos.to_string(),
-                    "vehicle_id": 903,
+                    "vehicle_id": vid,
                     "mounted_at": chrono::Utc::now().to_rfc3339(),
                     "mounted_odometer": 200_000,
                     "mount_reason": "new",
