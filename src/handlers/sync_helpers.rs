@@ -32,7 +32,8 @@ fn writable_columns(entity: EntityType) -> &'static [&'static str] {
         EntityType::TireAssignments => &[
             "id", "tire_id", "position_id", "vehicle_id", "work_order_id",
             "mounted_at", "mounted_odometer", "mount_reason",
-            "dismounted_at", "dismounted_odometer", "dismount_reason", "notes",
+            "dismounted_at", "dismounted_odometer", "dismount_reason",
+            "dismount_work_order_id", "notes",
         ],
         EntityType::TireStatusEvents => &[
             "id", "tire_id", "event_type", "work_order_id",
@@ -79,6 +80,7 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         // UUID-typed PKs and FKs need an explicit cast when extracted via ->>
         (_, "id") if entity.pk_column() == "id" => "::uuid",
         (_, "work_order_id") => "::uuid",
+        (_, "dismount_work_order_id") => "::uuid",
         (_, "parent_tire_id") => "::uuid",
         (_, "tire_id") => "::uuid",
         (_, "position_id") => "::uuid",
