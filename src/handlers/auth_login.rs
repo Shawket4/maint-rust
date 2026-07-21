@@ -28,7 +28,10 @@ async fn login(state: web::Data<AppState>, body: web::Json<LoginBody>) -> ApiRes
         let user_id = token::user_id_from_falcon_token(&state.jwt_secret, falcon_jwt)
             .ok_or_else(|| ApiError::Unauthorized("could not read user id from Falcon token".into()))?;
         let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-        let (jwt, exp) = token::mint(&state.jwt_secret, user_id, permission, "employee", 31)?;
+        // user_type must be "admin_user": FalconGo's Verify middleware rejects
+        // any other type before it even looks at the permission level, and this
+        // token is relayed upstream for /api/cars and the stock mirror.
+        let (jwt, exp) = token::mint(&state.jwt_secret, user_id, permission, "admin_user", 31)?;
         return Ok(HttpResponse::Ok().json(json!({
             "jwt": jwt, "exp": exp, "user_id": user_id, "permission": permission, "name": name,
         })));
