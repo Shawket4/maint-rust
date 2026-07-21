@@ -440,7 +440,7 @@ async fn mount_from_shipment_debits_stock_and_dismount_derives_status_and_km() {
         apply_push_batch(&pool, &PushBody { operations: vec![dismount] }, 1).await.unwrap();
     assert!(matches!(resp2.results[0], PushResultStatus::Applied { .. }));
 
-    let (status, km): (String, i32) = sqlx::query_as(
+    let (status, stored_km): (String, i32) = sqlx::query_as(
         "SELECT status::text, total_km FROM tires WHERE id = $1",
     )
     .bind(tire)
@@ -448,5 +448,12 @@ async fn mount_from_shipment_debits_stock_and_dismount_derives_status_and_km() {
     .await
     .unwrap();
     assert_eq!(status, "scrapped", "worn → scrapped, derived server-side");
-    assert_eq!(km, 40_000, "km accrued from the odometer delta");
+    assert_eq!(stored_km, 0, "stored column is BASE only — km is never accrued (0015)");
+    let derived_km: i64 =
+        sqlx::query_scalar("SELECT total_km FROM v_tires_list WHERE id = $1")
+            .bind(tire)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(derived_km, 40_000, "lifetime km derived from the assignment history");
 }

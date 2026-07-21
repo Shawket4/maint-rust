@@ -146,21 +146,17 @@ pub async fn after_apply(
                     .bind(&op.entity_id)
                     .fetch_optional(&mut **tx)
                     .await?;
-                if let Some((tire_id, mounted_km, dismounted_km, reason, is_spare)) = row {
+                if let Some((tire_id, _mounted_km, _dismounted_km, reason, _is_spare)) = row {
+                    // Status only. Lifetime km is DERIVED from the assignment
+                    // history (0015) — never accrued into tires.total_km.
                     let status = dismount_status(reason.as_deref().unwrap_or("other"));
-                    let delta = match (mounted_km, dismounted_km, is_spare) {
-                        (Some(m), Some(d), false) if d > m => d - m,
-                        _ => 0,
-                    };
                     sqlx::query(
                         "UPDATE tires SET status = $2::tire_status, \
-                                total_km = COALESCE(total_km, 0) + $3, \
                                 updated_at = now(), sync_version = sync_version + 1 \
                           WHERE id = $1",
                     )
                     .bind(tire_id)
                     .bind(status)
-                    .bind(delta)
                     .execute(&mut **tx)
                     .await?;
                 }
