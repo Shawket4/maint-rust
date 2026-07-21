@@ -149,6 +149,10 @@ async fn double_mount_on_position_errors_per_op_and_first_survives() {
     let vid = fresh_vehicle_id();
     let (_layout, pos) = seed_chassis(&pool, vid).await;
 
+    // Same DOT on both: a DOT is a manufacturing batch, not a serial — two
+    // tires bought together share it and BOTH must insert (0013 dropped the
+    // unique index that used to dead-letter the second one).
+    let shared_dot = format!("DOT {}", &Uuid::new_v4().to_string()[..8]);
     let mk_tire = |id: Uuid| {
         insert_op(
             EntityType::Tires,
@@ -158,6 +162,7 @@ async fn double_mount_on_position_errors_per_op_and_first_survives() {
                 "brand": "TestBrand",
                 "status": "in_stock_used",
                 "origin": "legacy",
+                "dot_code": shared_dot,
             }),
         )
     };
