@@ -17,35 +17,46 @@ use crate::error::{ApiError, ApiResult};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
-    MaintenanceTemplates,
-    MaintenanceRecords,
+    WorkOrders,
+    WorkOrderTasks,
+    Tires,
+    TireAssignments,
+    TireStatusEvents,
+    OilChanges,
     ChassisLayouts,
     ChassisAxles,
     ChassisPositions,
-    Tires,
-    TireAssignments,
+    VehicleClassAssignments,
     VehicleOdometerOverrides,
 }
 
 impl EntityType {
     pub fn table_name(self) -> &'static str {
         match self {
-            Self::MaintenanceTemplates => "maintenance_templates",
-            Self::MaintenanceRecords => "maintenance_records",
+            Self::WorkOrders => "work_orders",
+            Self::WorkOrderTasks => "work_order_tasks",
+            Self::Tires => "tires",
+            Self::TireAssignments => "tire_assignments",
+            Self::TireStatusEvents => "tire_status_events",
+            Self::OilChanges => "oil_changes",
             Self::ChassisLayouts => "chassis_layouts",
             Self::ChassisAxles => "chassis_axles",
             Self::ChassisPositions => "chassis_positions",
-            Self::Tires => "tires",
-            Self::TireAssignments => "tire_assignments",
+            Self::VehicleClassAssignments => "vehicle_class_assignments",
             Self::VehicleOdometerOverrides => "vehicle_odometer_overrides",
         }
     }
 
     pub fn pk_column(self) -> &'static str {
         match self {
-            Self::VehicleOdometerOverrides => "vehicle_id",
+            Self::VehicleClassAssignments | Self::VehicleOdometerOverrides => "vehicle_id",
             _ => "id",
         }
+    }
+
+    /// Tables that upsert on PK conflict rather than insert (PK-keyed singletons).
+    pub fn upserts_on_conflict(self) -> bool {
+        matches!(self, Self::VehicleClassAssignments | Self::VehicleOdometerOverrides)
     }
 }
 
@@ -197,7 +208,7 @@ pub async fn apply_push_operation(
 
     match op.operation {
         SyncOperation::Insert => {
-            if row_now.is_some() && op.entity_type != EntityType::VehicleOdometerOverrides {
+            if row_now.is_some() && !op.entity_type.upserts_on_conflict() {
                 // Idempotent insert: if sync_version matches, treat as no-op applied.
                 let server_sv = row_now
                     .as_ref()
@@ -281,9 +292,8 @@ pub async fn apply_push_operation(
                     server_row: row_now,
                 });
             }
-            // Soft delete only; vehicle_odometer_overrides has no deleted_at, so update happens via column flag.
+            // Soft delete only; vehicle_odometer_overrides has no deleted_at.
             if op.entity_type == EntityType::VehicleOdometerOverrides {
-                // No soft-delete column — refuse delete.
                 return Ok(PushResultStatus::Error {
                     entity_id: op.entity_id.clone(),
                     message: "vehicle_odometer_overrides does not support delete".into(),

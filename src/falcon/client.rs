@@ -60,4 +60,54 @@ impl FalconClient {
         let v = resp.json::<serde_json::Value>().await?;
         Ok(v)
     }
+
+    /// Authenticated POST (relays the caller's token as Cookie: jwt=…). Used for
+    /// the S2S stock debit. Returns (status, json).
+    pub async fn post_json(
+        &self,
+        path: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> ApiResult<(u16, serde_json::Value)> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .inner
+            .post(&url)
+            .headers(Self::auth_headers(token))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| if e.is_timeout() { ApiError::UpstreamTimeout } else { ApiError::Reqwest(e) })?;
+        let status = resp.status().as_u16();
+        let v = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+        Ok((status, v))
+    }
+
+    /// Unauthenticated POST — used by the login proxy. Returns (status, json).
+    pub async fn post_json_unauth(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> ApiResult<(u16, serde_json::Value)> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .inner
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ApiError::UpstreamTimeout
+                } else {
+                    ApiError::Reqwest(e)
+                }
+            })?;
+        let status = resp.status().as_u16();
+        let v = resp
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        Ok((status, v))
+    }
 }

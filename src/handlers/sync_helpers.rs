@@ -16,16 +16,31 @@ use crate::services::sync_engine::EntityType;
 /// Columns the client may supply via sync. Excludes audit columns + sync_version + timestamps.
 fn writable_columns(entity: EntityType) -> &'static [&'static str] {
     match entity {
-        EntityType::MaintenanceTemplates => &[
-            "id", "vehicle_id", "category_id", "name_ar", "name_en",
-            "notes_ar", "notes_en", "trigger_type", "interval_km", "interval_days",
-            "lead_warn_km", "lead_warn_days", "is_active",
+        EntityType::WorkOrders => &[
+            "id", "vehicle_id", "status", "title", "odometer_at_open",
+            "opened_at", "closed_at", "notes_ar", "notes_en",
         ],
-        EntityType::MaintenanceRecords => &[
-            "id", "template_id", "vehicle_id", "category_id",
-            "performed_at", "odometer_at_service",
-            "next_due_at", "next_due_km",
-            "cost", "vendor", "performed_by", "notes", "attachments",
+        EntityType::WorkOrderTasks => &[
+            "id", "work_order_id", "kind", "category_id",
+            "description_ar", "description_en", "is_done", "sort_order",
+        ],
+        EntityType::Tires => &[
+            "id", "dot_code", "brand", "model", "size",
+            "status", "origin", "total_km", "parent_tire_id", "retread_count",
+            "notes_ar", "notes_en",
+        ],
+        EntityType::TireAssignments => &[
+            "id", "tire_id", "position_id", "vehicle_id", "work_order_id",
+            "mounted_at", "mounted_odometer", "mount_reason",
+            "dismounted_at", "dismounted_odometer", "dismount_reason", "notes",
+        ],
+        EntityType::TireStatusEvents => &[
+            "id", "tire_id", "event_type", "work_order_id",
+            "from_status", "to_status", "notes", "occurred_at",
+        ],
+        EntityType::OilChanges => &[
+            "id", "work_order_id", "vehicle_id", "oil_type", "liters",
+            "odometer", "flagged", "notes", "performed_at",
         ],
         EntityType::ChassisLayouts => &["id", "vehicle_id", "name_ar", "name_en"],
         EntityType::ChassisAxles => &[
@@ -36,18 +51,7 @@ fn writable_columns(entity: EntityType) -> &'static [&'static str] {
             "id", "layout_id", "axle_id", "side", "depth",
             "is_spare", "spare_index", "position_code",
         ],
-        EntityType::Tires => &[
-            "id", "dot_code", "internal_serial", "brand", "model",
-            "purchase_date", "purchase_cost", "supplier",
-            "production_week", "production_year", "production_date",
-            "is_retread", "retread_count", "parent_tire_id",
-            "status", "stock_location", "scrap_reason", "scrap_date", "notes",
-        ],
-        EntityType::TireAssignments => &[
-            "id", "tire_id", "position_id", "vehicle_id",
-            "mounted_at", "mounted_odometer", "dismounted_at", "dismounted_odometer",
-            "mount_reason", "dismount_reason", "notes",
-        ],
+        EntityType::VehicleClassAssignments => &["vehicle_id", "class_id"],
         EntityType::VehicleOdometerOverrides => &[
             "vehicle_id", "odometer", "set_at", "notes",
         ],
@@ -58,50 +62,49 @@ fn writable_columns(entity: EntityType) -> &'static [&'static str] {
 /// Returns either an empty string or "::<type>".
 fn pg_cast(entity: EntityType, col: &str) -> &'static str {
     match (entity, col) {
-        (EntityType::MaintenanceTemplates, "trigger_type") => "::maintenance_trigger",
+        // Enums
+        (EntityType::WorkOrders, "status") => "::work_order_status",
+        (EntityType::WorkOrderTasks, "kind") => "::wo_task_kind",
+        (EntityType::Tires, "status") => "::tire_status",
+        (EntityType::Tires, "origin") => "::tire_origin",
+        (EntityType::TireAssignments, "mount_reason") => "::mount_reason",
+        (EntityType::TireAssignments, "dismount_reason") => "::dismount_reason",
+        (EntityType::TireStatusEvents, "event_type") => "::tire_event_type",
+        (EntityType::TireStatusEvents, "from_status") => "::tire_status",
+        (EntityType::TireStatusEvents, "to_status") => "::tire_status",
         (EntityType::ChassisAxles, "section") => "::chassis_section",
         (EntityType::ChassisAxles, "axle_type") => "::axle_type",
         (EntityType::ChassisPositions, "side") => "::position_side",
         (EntityType::ChassisPositions, "depth") => "::position_depth",
-        (EntityType::Tires, "status") => "::tire_status",
-        (EntityType::TireAssignments, "mount_reason") => "::mount_reason",
-        (EntityType::TireAssignments, "dismount_reason") => "::mount_reason",
         // UUID-typed PKs and FKs need an explicit cast when extracted via ->>
         (_, "id") if entity.pk_column() == "id" => "::uuid",
-        (EntityType::MaintenanceRecords, "template_id") => "::uuid",
-        (EntityType::ChassisAxles, "layout_id") => "::uuid",
-        (EntityType::ChassisPositions, "layout_id") => "::uuid",
-        (EntityType::ChassisPositions, "axle_id") => "::uuid",
-        (EntityType::Tires, "parent_tire_id") => "::uuid",
-        (EntityType::TireAssignments, "tire_id") => "::uuid",
-        (EntityType::TireAssignments, "position_id") => "::uuid",
+        (_, "work_order_id") => "::uuid",
+        (_, "parent_tire_id") => "::uuid",
+        (_, "tire_id") => "::uuid",
+        (_, "position_id") => "::uuid",
+        (_, "layout_id") => "::uuid",
+        (_, "axle_id") => "::uuid",
         // Integer columns
-        (_, "vehicle_id") | (_, "odometer") | (_, "odometer_at_service") |
-        (_, "next_due_km") | (_, "interval_km") | (_, "interval_days") |
-        (_, "lead_warn_km") | (_, "lead_warn_days") | (_, "section_index") |
-        (_, "spare_index") | (_, "mounted_odometer") | (_, "dismounted_odometer") |
-        (_, "production_week") | (_, "production_year") | (_, "retread_count") => "::integer",
+        (_, "vehicle_id") | (_, "odometer") | (_, "odometer_at_open") |
+        (_, "total_km") | (_, "section_index") | (_, "spare_index") |
+        (_, "sort_order") | (_, "mounted_odometer") | (_, "dismounted_odometer") |
+        (_, "retread_count") => "::integer",
         // Numeric/Decimal columns
-        (_, "cost") | (_, "purchase_cost") => "::numeric",
-        // Date columns
-        (_, "purchase_date") | (_, "production_date") | (_, "scrap_date") => "::date",
+        (_, "liters") => "::numeric",
         // Timestamptz columns
-        (_, "set_at") | (_, "performed_at") | (_, "next_due_at") |
+        (_, "set_at") | (_, "performed_at") | (_, "occurred_at") |
+        (_, "opened_at") | (_, "closed_at") |
         (_, "mounted_at") | (_, "dismounted_at") => "::timestamptz",
         // Boolean columns
-        (_, "is_active") | (_, "is_steering") | (_, "is_lifted") |
-        (_, "is_spare") | (_, "is_retread") => "::boolean",
-        // JSONB columns use the value-as-jsonb extraction below; no cast needed
+        (_, "is_done") | (_, "is_steering") | (_, "is_lifted") |
+        (_, "is_spare") | (_, "flagged") => "::boolean",
         _ => "",
     }
 }
 
 /// JSONB-typed columns are extracted via -> (preserving JSON), all others via ->> (text → cast).
-fn is_jsonb(entity: EntityType, col: &str) -> bool {
-    matches!(
-        (entity, col),
-        (EntityType::MaintenanceRecords, "attachments")
-    )
+fn is_jsonb(_entity: EntityType, _col: &str) -> bool {
+    false
 }
 
 pub async fn insert_from_payload(
@@ -140,7 +143,7 @@ pub async fn insert_from_payload(
     let mut q = format!(
         "INSERT INTO {table} ({cols_sql}) VALUES ({vals_sql})"
     );
-    if entity == EntityType::VehicleOdometerOverrides {
+    if entity.upserts_on_conflict() {
         q.push_str(" ON CONFLICT (vehicle_id) DO UPDATE SET ");
         let mut updates = Vec::new();
         for col in col_list.iter() {
@@ -148,7 +151,7 @@ pub async fn insert_from_payload(
             updates.push(format!("{col} = EXCLUDED.{col}"));
         }
         updates.push("updated_at = now()".to_string());
-        updates.push("sync_version = vehicle_odometer_overrides.sync_version + 1".to_string());
+        updates.push(format!("sync_version = {table}.sync_version + 1"));
         q.push_str(&updates.join(", "));
     }
     q.push_str(" RETURNING sync_version");

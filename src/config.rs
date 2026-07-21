@@ -11,6 +11,11 @@ pub struct Config {
     pub bind_addr: String,
     pub falcon_cars_cache_ttl: u64,
     pub falcon_invoices_cache_ttl: u64,
+    pub dev_login: bool,
+    /// Read-only connection to Falcon's Postgres (service history + AI SQL tool).
+    pub falcon_database_url: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub ai_model: String,
 }
 
 impl Config {
@@ -37,6 +42,12 @@ impl Config {
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
                 .unwrap_or(30),
+            dev_login: env::var("MAINT_DEV_LOGIN")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            falcon_database_url: env::var("FALCON_DATABASE_URL").ok(),
+            anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok(),
+            ai_model: env::var("AI_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string()),
         })
     }
 }

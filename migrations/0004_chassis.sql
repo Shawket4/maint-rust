@@ -15,12 +15,6 @@ CREATE TABLE chassis_layouts (
 );
 CREATE INDEX idx_layouts_updated ON chassis_layouts(updated_at);
 
--- =========================================================
--- chassis_axles: ordered list, tractor + trailer sections
--- =========================================================
-CREATE TYPE chassis_section AS ENUM ('tractor', 'trailer');
-CREATE TYPE axle_type       AS ENUM ('single', 'dual');
-
 CREATE TABLE chassis_axles (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     layout_id               UUID NOT NULL REFERENCES chassis_layouts(id) ON DELETE CASCADE,
@@ -40,12 +34,6 @@ CREATE TABLE chassis_axles (
     UNIQUE (layout_id, section, section_index)
 );
 CREATE INDEX idx_axles_updated ON chassis_axles(updated_at);
-
--- =========================================================
--- chassis_positions: enumerated per axle, plus spare slots
--- =========================================================
-CREATE TYPE position_side  AS ENUM ('left', 'right');
-CREATE TYPE position_depth AS ENUM ('single', 'inner', 'outer');
 
 CREATE TABLE chassis_positions (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -38,6 +38,21 @@ async fn main() -> anyhow::Result<()> {
         .context("running migrations")?;
     tracing::info!("migrations up to date");
 
+    // Optional read-only pool to Falcon's Postgres (service history + AI SQL tool).
+    let falcon_pool = match &cfg.falcon_database_url {
+        Some(url) => match db::init_pool(url).await {
+            Ok(p) => {
+                tracing::info!("connected read-only pool to Falcon Postgres");
+                Some(p)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not connect Falcon Postgres pool");
+                None
+            }
+        },
+        None => None,
+    };
+
     let falcon = FalconClient::new(cfg.falcon_base_url.clone());
     let cache = CacheManager::new(cfg.redis_url.as_deref()).await;
 
@@ -47,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
         cache,
         falcon_cars_ttl: cfg.falcon_cars_cache_ttl,
         falcon_invoices_ttl: cfg.falcon_invoices_cache_ttl,
+        jwt_secret: cfg.jwt_secret.clone(),
+        dev_login: cfg.dev_login,
+        falcon_pool,
+        anthropic_api_key: cfg.anthropic_api_key.clone(),
+        ai_model: cfg.ai_model.clone(),
     };
 
     let bind = (cfg.bind_addr.clone(), cfg.port);
@@ -64,18 +84,20 @@ async fn main() -> anyhow::Result<()> {
             .service(
                 web::scope("/api/maint")
                     .configure(handlers::health::configure)
+                    .configure(handlers::auth_login::configure)
                     .service(
                         web::scope("")
                             .wrap(auth_mw)
                             .configure(handlers::cache_vehicles::configure)
                             .configure(handlers::cache_invoices::configure)
-                            .configure(handlers::templates::configure)
-                            .configure(handlers::records::configure)
+                            .configure(handlers::reference::configure)
                             .configure(handlers::due::configure)
-                            .configure(handlers::overrides::configure)
-                            .configure(handlers::chassis::configure)
+                            .configure(handlers::plans::configure)
+                            .configure(handlers::stock::configure)
+                            .configure(handlers::work_orders::configure)
                             .configure(handlers::tires::configure)
-                            .configure(handlers::assignments::configure)
+                            .configure(handlers::service::configure)
+                            .configure(handlers::ai::configure)
                             .configure(handlers::sync::configure),
                     ),
             )
