@@ -54,7 +54,7 @@ fn writable_columns(entity: EntityType) -> &'static [&'static str] {
         ],
         EntityType::VehicleClassAssignments => &["vehicle_id", "class_id"],
         EntityType::VehicleOdometerOverrides => &[
-            "vehicle_id", "odometer", "set_at", "notes",
+            "vehicle_id", "odometer", "set_at", "notes", "superseded_km",
         ],
     }
 }
@@ -90,7 +90,7 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (_, "vehicle_id") | (_, "odometer") | (_, "odometer_at_open") |
         (_, "total_km") | (_, "section_index") | (_, "spare_index") |
         (_, "sort_order") | (_, "mounted_odometer") | (_, "dismounted_odometer") |
-        (_, "retread_count") => "::integer",
+        (_, "retread_count") | (_, "superseded_km") => "::integer",
         // Numeric/Decimal columns
         (_, "liters") => "::numeric",
         // Timestamptz columns
