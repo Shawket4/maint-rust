@@ -942,3 +942,166 @@ async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
         "latest record without km = no usable baseline for a mileage plan"
     );
 }
+
+/// Serde round-trip pin of the wire vocabulary — the client pins the same 11
+/// strings in its schema registry test; a rename on either side is a red test,
+/// not a live sync failure.
+#[test]
+fn entity_vocabulary_round_trips_as_snake_case() {
+    let expect = [
+        (EntityType::ChassisLayouts, "chassis_layouts"),
+        (EntityType::ChassisAxles, "chassis_axles"),
+        (EntityType::ChassisPositions, "chassis_positions"),
+        (EntityType::WorkOrders, "work_orders"),
+        (EntityType::WorkOrderTasks, "work_order_tasks"),
+        (EntityType::OilChanges, "oil_changes"),
+        (EntityType::VehicleClassAssignments, "vehicle_class_assignments"),
+        (EntityType::VehicleOdometerOverrides, "vehicle_odometer_overrides"),
+        (EntityType::Tires, "tires"),
+        (EntityType::TireAssignments, "tire_assignments"),
+        (EntityType::TireStatusEvents, "tire_status_events"),
+    ];
+    for (variant, wire) in expect {
+        let ser = serde_json::to_string(&variant).unwrap();
+        assert_eq!(ser, format!("\"{wire}\""));
+        assert_eq!(variant.table_name(), wire);
+        let de: EntityType = serde_json::from_str(&ser).unwrap();
+        assert_eq!(de, variant);
+    }
+}
+
+/// Server twin of the client's `override_corrects_downward_and_later_readings_resume`
+/// (src-tauri views.rs): the SAME seeds must produce the SAME odometer truth
+/// on both sides — this pair of tests is the executable contract for the
+/// arbitration rule (0014 + 0017).
+#[tokio::test]
+async fn override_corrects_downward_and_later_readings_resume_in_the_view() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+
+    // Falcon fuel says 500_000 (a bad head unit).
+    sqlx::query(
+        "INSERT INTO vehicles_cache (id, car_no_plate, last_fuel_odometer, raw_payload, fetched_at)
+         VALUES ($1, 'PARITY-1', 500000, '{}'::jsonb, now())",
+    )
+    .bind(vid as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    async fn odo(pool: &PgPool, vid: i64) -> (i32, String) {
+        sqlx::query_as(
+            "SELECT current_odometer, odometer_source FROM v_current_odometer WHERE vehicle_id = $1",
+        )
+        .bind(vid as i32)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+    assert_eq!(odo(&pool, vid).await, (500_000, "falcon_fuel".into()));
+
+    // Downward correction to 300_000, pinning the bogus fuel value.
+    sqlx::query(
+        "INSERT INTO vehicle_odometer_overrides
+           (vehicle_id, odometer, set_at, superseded_km, created_by_user_id, updated_by_user_id)
+         VALUES ($1, 300000, now(), 500000, 1, 1)",
+    )
+    .bind(vid as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        odo(&pool, vid).await,
+        (300_000, "manual_override".into()),
+        "the correction wins even though it is LOWER — the fuel reading is pinned"
+    );
+
+    // The truck genuinely drives past the corrected number → fuel re-engages.
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 510000 WHERE id = $1")
+        .bind(vid as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        odo(&pool, vid).await,
+        (510_000, "falcon_fuel".into()),
+        "a reading past superseded_km resumes normal arbitration"
+    );
+
+    // Zero fuel readings are sensor artifacts, never the truth (0017).
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 0 WHERE id = $1")
+        .bind(vid as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        odo(&pool, vid).await,
+        (300_000, "manual_override".into()),
+        "a 0 fuel reading must not become current_odometer"
+    );
+}
+
+/// Server twin of the client's `mounted_tire_km_is_live_with_the_odometer`:
+/// v_tires_list's derived lifetime km = base + closed road deltas + live run.
+#[tokio::test]
+async fn mounted_tire_km_is_live_with_the_odometer_in_the_view() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+    let (_layout, pos) = seed_chassis(&pool, vid).await;
+    sqlx::query(
+        "INSERT INTO vehicles_cache (id, car_no_plate, last_fuel_odometer, raw_payload, fetched_at)
+         VALUES ($1, 'PARITY-2', 260000, '{}'::jsonb, now())",
+    )
+    .bind(vid as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tire = Uuid::new_v4();
+    let asg = Uuid::new_v4();
+    let body = PushBody {
+        operations: vec![
+            insert_op(
+                EntityType::Tires,
+                &tire.to_string(),
+                json!({ "id": tire.to_string(), "brand": "B", "status": "in_stock_used",
+                        "origin": "legacy", "total_km": 10_000 }),
+            ),
+            insert_op(
+                EntityType::TireAssignments,
+                &asg.to_string(),
+                json!({
+                    "id": asg.to_string(),
+                    "tire_id": tire.to_string(),
+                    "position_id": pos.to_string(),
+                    "vehicle_id": vid,
+                    "mounted_at": chrono::Utc::now().to_rfc3339(),
+                    "mounted_odometer": 200_000,
+                    "mount_reason": "new",
+                }),
+            ),
+        ],
+    };
+    let (resp, _) = apply_push_batch(&pool, &body, 1).await.unwrap();
+    assert!(matches!(resp.results[1], PushResultStatus::Applied { .. }));
+
+    let km: i64 = sqlx::query_scalar("SELECT total_km FROM v_tires_list WHERE id = $1")
+        .bind(tire)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(km, 70_000, "base 10k + live run (260k − 200k) — live with the odometer");
+
+    // The odometer moves → the derived km moves with it, nothing re-baked.
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 275000 WHERE id = $1")
+        .bind(vid as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let km: i64 = sqlx::query_scalar("SELECT total_km FROM v_tires_list WHERE id = $1")
+        .bind(tire)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(km, 85_000);
+}
