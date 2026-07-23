@@ -119,6 +119,22 @@ jobs:
           sudo chmod +x ${DEPLOY_DIR}/maint-rust
           sudo chown -R root:root ${DEPLOY_DIR}
 
+          # Nightly Postgres backup — this DB is the sole home of all
+          # maintenance truth; the binary backup above never covered it.
+          sudo tee /etc/cron.daily/maint-pg-backup > /dev/null << 'CRON'
+          #!/bin/bash
+          set -e
+          BACKUP_DIR=/opt/maint-rust/backups/pg
+          mkdir -p "$BACKUP_DIR"
+          STAMP=$(date +%Y%m%d)
+          # DATABASE_URL from the service env file
+          source /opt/maint-rust/.env
+          pg_dump "$DATABASE_URL" | gzip > "$BACKUP_DIR/apex_maint_$STAMP.sql.gz"
+          # keep 14 days
+          ls -t "$BACKUP_DIR"/apex_maint_*.sql.gz | tail -n +15 | xargs -r rm
+          CRON
+          sudo chmod +x /etc/cron.daily/maint-pg-backup
+
           if [ ! -f ${DEPLOY_DIR}/.env ] && [ -f ${DEPLOY_DIR}/.env.example ]; then
             echo "Creating .env from .env.example..."
             sudo cp ${DEPLOY_DIR}/.env.example ${DEPLOY_DIR}/.env

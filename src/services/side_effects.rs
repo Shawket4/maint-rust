@@ -192,6 +192,20 @@ pub async fn after_apply(
                     .execute(&mut **tx)
                     .await?;
                 }
+                // A restock FROM the retreader completes a retread — the
+                // lineage counter moves here (it was schema-only before:
+                // nothing ever wrote retread_count).
+                let event_type = payload.get("event_type").and_then(|v| v.as_str());
+                let from_status = payload.get("from_status").and_then(|v| v.as_str());
+                if event_type == Some("restock") && from_status == Some("retreading") {
+                    sqlx::query(
+                        "UPDATE tires SET retread_count = COALESCE(retread_count,0) + 1, \
+                         updated_at = now(), sync_version = sync_version + 1 WHERE id = $1",
+                    )
+                    .bind(tire_id)
+                    .execute(&mut **tx)
+                    .await?;
+                }
             }
         }
 
