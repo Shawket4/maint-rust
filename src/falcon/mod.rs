@@ -1,4 +1,3 @@
-pub mod auth;
 pub mod cache;
 pub mod cars;
 pub mod client;

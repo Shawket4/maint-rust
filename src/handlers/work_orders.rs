@@ -66,8 +66,11 @@ async fn get_work_order(pool: web::Data<PgPool>, path: web::Path<String>) -> Api
     .fetch_all(pool.get_ref())
     .await?;
 
+    // Both attributions (0012): a dismount performed under THIS WO on a tire
+    // mounted under an earlier WO belongs to this WO's tire work too.
     let tires: Vec<(Value,)> = sqlx::query_as(
-        "SELECT to_jsonb(a) FROM tire_assignments a WHERE a.work_order_id = $1 AND a.deleted_at IS NULL",
+        "SELECT to_jsonb(a) FROM tire_assignments a \
+         WHERE (a.work_order_id = $1 OR a.dismount_work_order_id = $1) AND a.deleted_at IS NULL",
     )
     .bind(id)
     .fetch_all(pool.get_ref())

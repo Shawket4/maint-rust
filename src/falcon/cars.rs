@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 
 use super::cache::CacheManager;
 use super::client::FalconClient;
@@ -76,23 +75,6 @@ pub async fn upsert_cars_into_cache(
 ) -> ApiResult<()> {
     let mut tx = pool.begin().await?;
 
-    // Fetch all odometer overrides to apply them during upsert/projection.
-    // Per USER: override replaces fetched mileage if override > fetched.
-    let overrides_rows = sqlx::query(
-        "SELECT vehicle_id, odometer FROM vehicle_odometer_overrides"
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-
-    let overrides: HashMap<i32, i32> = overrides_rows
-        .into_iter()
-        .map(|r| {
-            let vid: i32 = r.get("vehicle_id");
-            let odo: i32 = r.get("odometer");
-            (vid, odo)
-        })
-        .collect();
-
     // Build the set of seen ids so we can soft-delete missing rows.
     let mut seen_vehicle_ids: Vec<i32> = Vec::with_capacity(vehicles.len());
 
@@ -145,18 +127,12 @@ pub async fn upsert_cars_into_cache(
             .get("last_oil_change_id")
             .and_then(|x| x.as_i64())
             .map(|x| x as i32);
-        let mut mileage = v.get("mileage").and_then(|x| x.as_i64()).map(|x| x as i32);
-
-        if let Some(&ov) = overrides.get(&id) {
-            if mileage.map_or(true, |m| ov > m) {
-                mileage = Some(ov);
-                // Sync the change back into the Value object so the caller (get_cache_vehicles) 
-                // sees the override in the JSON response.
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("mileage".to_string(), serde_json::json!(ov));
-                }
-            }
-        }
+        // The mirror stays PURE Falcon data. Odometer overrides participate in
+        // arbitration only through v_current_odometer (0014, where downward
+        // corrections work via superseded_km) — merging them here was an
+        // upward-only second arbitration rule that contradicted it and
+        // contaminated raw_payload.
+        let mileage = v.get("mileage").and_then(|x| x.as_i64()).map(|x| x as i32);
         let driver_id = v.get("driver_id").and_then(|x| x.as_i64()).map(|x| x as i32);
         let operating_company = v
             .get("operating_company")

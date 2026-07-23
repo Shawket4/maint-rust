@@ -18,6 +18,10 @@ use crate::services::stock_ledger;
 /// Mirror Falcon's authoritative tire ledger into tire_stock_cache, then return it (§4).
 #[get("/stock/tires")]
 async fn tire_stock(state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
+    // Replay any unmirrored debits FIRST — the refresh below overwrites our
+    // local decrements with Falcon's counts, so Falcon must see the debits
+    // before its numbers become ours.
+    stock_ledger::mirror_unmirrored(&state, &token.0).await;
     if let Ok(v) = state.falcon.get_json("/api/maint-stock/tires", &token.0).await {
         if let Some(arr) = v.as_array() {
             for row in arr {
@@ -40,6 +44,9 @@ async fn tire_stock(state: web::Data<AppState>, token: BearerToken) -> ApiResult
 
 #[get("/stock/oil")]
 async fn oil_stock(state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
+    // Same ordering rule as /stock/tires: debits reach Falcon before Falcon's
+    // counts replace the local cache.
+    stock_ledger::mirror_unmirrored(&state, &token.0).await;
     if let Ok(v) = state.falcon.get_json("/api/maint-stock/oil", &token.0).await {
         if let Some(arr) = v.as_array() {
             for row in arr {

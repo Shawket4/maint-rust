@@ -115,7 +115,9 @@ pub async fn mirror_debits(state: &AppState, token: &str, refs: &[Uuid]) {
             "ref_id": m.get("ref_id"), "work_order_id": m.get("work_order_id"),
         });
         match state.falcon.post_json("/api/maint-stock/debit", token, &payload).await {
-            Ok((200, _)) => {
+            // Any 2xx is an ack — requiring exactly 200 left 201/204 rows
+            // permanently un-mirrored.
+            Ok((s, _)) if (200..300).contains(&s) => {
                 let _ = sqlx::query(
                     "UPDATE stock_movements SET mirrored_to_falcon_at = now() WHERE ref_id = $1",
                 )
@@ -123,8 +125,34 @@ pub async fn mirror_debits(state: &AppState, token: &str, refs: &[Uuid]) {
                 .execute(&state.pool)
                 .await;
             }
-            Ok((s, _)) => tracing::warn!(status = s, "falcon debit non-200 (will reconcile later)"),
+            Ok((s, _)) => tracing::warn!(status = s, "falcon debit non-2xx (will reconcile later)"),
             Err(e) => tracing::warn!(error = %e, "falcon debit push failed (offline; reconcile later)"),
         }
     }
+}
+
+/// The reconciler the `mirrored_to_falcon_at IS NULL` marker exists for:
+/// replay every movement whose one post-commit mirror attempt failed. Called
+/// from the push handler (any device syncing retries the backlog) and before
+/// stock refreshes (so Falcon's counts include our debits before we overwrite
+/// the local cache with them). Best-effort, idempotent upstream on ref_id.
+pub async fn mirror_unmirrored(state: &AppState, token: &str) {
+    let refs: Vec<(Uuid,)> = match sqlx::query_as(
+        "SELECT ref_id FROM stock_movements WHERE mirrored_to_falcon_at IS NULL \
+         ORDER BY created_at ASC LIMIT 100",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "mirror_unmirrored: backlog lookup failed");
+            return;
+        }
+    };
+    if refs.is_empty() {
+        return;
+    }
+    let refs: Vec<Uuid> = refs.into_iter().map(|t| t.0).collect();
+    mirror_debits(state, token, &refs).await;
 }

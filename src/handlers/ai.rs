@@ -10,6 +10,7 @@ use actix_web::{post, web, HttpResponse};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::auth::AuthClaims;
 use crate::error::{ApiError, ApiResult};
 use crate::handlers::AppState;
 
@@ -53,20 +54,35 @@ async fn run_sql(pool: &sqlx::PgPool, query: &str) -> String {
     if !is_safe_select(query) {
         return json!({"error": "only read-only SELECT queries are allowed"}).to_string();
     }
-    match sqlx::query_as::<_, (Value,)>(&format!(
-        "SELECT COALESCE(jsonb_agg(t), '[]'::jsonb) FROM ({}) t",
-        query.trim_end().trim_end_matches(';')
-    ))
-    .fetch_one(pool)
-    .await
-    {
-        Ok((rows,)) => rows.to_string(),
+    // Defense in depth: the blacklist above constrains statement *shape*; the
+    // READ ONLY transaction makes writes impossible at the database level no
+    // matter what the model emits.
+    let inner = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
+        let (rows,): (Value,) = sqlx::query_as(&format!(
+            "SELECT COALESCE(jsonb_agg(t), '[]'::jsonb) FROM ({}) t",
+            query.trim_end().trim_end_matches(';')
+        ))
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+        Ok::<Value, sqlx::Error>(rows)
+    };
+    match inner.await {
+        Ok(rows) => rows.to_string(),
         Err(e) => json!({"error": format!("{e}")}).to_string(),
     }
 }
 
 #[post("/ai/query")]
-async fn ai_query(state: web::Data<AppState>, body: web::Json<AiQuery>) -> ApiResult<HttpResponse> {
+async fn ai_query(
+    state: web::Data<AppState>,
+    // Extracting claims makes authentication mandatory for this endpoint —
+    // the model-driven run_sql tool must never be reachable anonymously.
+    _claims: AuthClaims,
+    body: web::Json<AiQuery>,
+) -> ApiResult<HttpResponse> {
     let api_key = state
         .anthropic_api_key
         .as_ref()

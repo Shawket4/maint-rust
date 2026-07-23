@@ -60,6 +60,12 @@ impl EntityType {
     pub fn upserts_on_conflict(self) -> bool {
         matches!(self, Self::VehicleClassAssignments | Self::VehicleOdometerOverrides)
     }
+
+    /// Every owned table soft-deletes except the odometer override (PK
+    /// vehicle_id, no tombstone — /sync/push refuses deletes on it).
+    pub fn has_deleted_at(self) -> bool {
+        !matches!(self, Self::VehicleOdometerOverrides)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +256,12 @@ pub async fn apply_push_operation(
             }
             // Server-owned derived fields (e.g. the oil flag) override the client.
             let mut payload = op.payload.clone();
+            // The ack is keyed on entity_id, so the row MUST land under it. A
+            // payload missing or contradicting its own PK would otherwise
+            // insert under a table-default UUID — acked under an id it doesn't
+            // bear, and re-inserted on every redelivery (the idempotency check
+            // above looks up entity_id and finds nothing).
+            payload[op.entity_type.pk_column()] = Value::String(op.entity_id.clone());
             side_effects::normalize_insert(op.entity_type, &mut payload);
             // Build column list from payload, force audit columns server-side.
             match generic_insert(tx, op.entity_type, &payload, user_id).await {
@@ -299,16 +311,40 @@ pub async fn apply_push_operation(
                     no_refs,
                 ));
             }
-            match generic_update(tx, op.entity_type, &op.entity_id, &op.payload, user_id).await {
-                Ok(new_sv) => {
-                    let refs =
-                        side_effects::after_apply(tx, op, &op.payload, Some(&row_now)).await?;
+            // Server-owned derived fields (the oil flag) are stripped or
+            // recomputed — the client may never overwrite them on update.
+            let mut payload = op.payload.clone();
+            side_effects::normalize_update(op.entity_type, &mut payload);
+            match generic_update(tx, op.entity_type, &op.entity_id, &payload, user_id, server_sv)
+                .await
+            {
+                Ok(Some(new_sv)) => {
+                    let refs = side_effects::after_apply(tx, op, &payload, Some(&row_now)).await?;
                     Ok((
                         PushResultStatus::Applied {
                             entity_id: op.entity_id.clone(),
                             new_sync_version: new_sv,
                         },
                         refs,
+                    ))
+                }
+                // The guarded UPDATE matched no row: a concurrent batch
+                // committed between our read and this statement. Re-read and
+                // report the conflict instead of silently overwriting.
+                Ok(None) => {
+                    let fresh = fetch_row_json(tx, table, pk, &op.entity_id).await?;
+                    Ok((
+                        match fresh {
+                            Some(server_row) => PushResultStatus::Conflict {
+                                entity_id: op.entity_id.clone(),
+                                server_row,
+                            },
+                            None => PushResultStatus::Error {
+                                entity_id: op.entity_id.clone(),
+                                message: "row not found".into(),
+                            },
+                        },
+                        no_refs,
                     ))
                 }
                 Err(ApiError::BadRequest(m)) => Ok((
@@ -339,6 +375,24 @@ pub async fn apply_push_operation(
                 .get("sync_version")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+            let already_deleted = row_now
+                .get("deleted_at")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            // Lost-ack replay: the delete already applied (sv bumped once past
+            // the client's base and the tombstone is set). Redelivery must ack
+            // as a no-op — the Insert path's (0,1) rule, for deletes. Without
+            // this, every delete acked into a dropped response becomes a
+            // conflict dead-letter on flaky networks.
+            if already_deleted && server_sv == op.sync_version + 1 {
+                return Ok((
+                    PushResultStatus::Applied {
+                        entity_id: op.entity_id.clone(),
+                        new_sync_version: server_sv,
+                    },
+                    no_refs,
+                ));
+            }
             if server_sv != op.sync_version {
                 return Ok((
                     PushResultStatus::Conflict {
@@ -349,7 +403,7 @@ pub async fn apply_push_operation(
                 ));
             }
             // Soft delete only; vehicle_odometer_overrides has no deleted_at.
-            if op.entity_type == EntityType::VehicleOdometerOverrides {
+            if !op.entity_type.has_deleted_at() {
                 return Ok((
                     PushResultStatus::Error {
                         entity_id: op.entity_id.clone(),
@@ -358,14 +412,37 @@ pub async fn apply_push_operation(
                     no_refs,
                 ));
             }
-            let new_sv = soft_delete(tx, op.entity_type, &op.entity_id, user_id).await?;
-            Ok((
-                PushResultStatus::Applied {
-                    entity_id: op.entity_id.clone(),
-                    new_sync_version: new_sv,
-                },
-                no_refs,
-            ))
+            match soft_delete(tx, op.entity_type, &op.entity_id, user_id, server_sv).await? {
+                Some(new_sv) => {
+                    // Deletes have consequences too (e.g. tombstoning an OPEN
+                    // assignment must un-mount the tire).
+                    let refs =
+                        side_effects::after_apply(tx, op, &op.payload, Some(&row_now)).await?;
+                    Ok((
+                        PushResultStatus::Applied {
+                            entity_id: op.entity_id.clone(),
+                            new_sync_version: new_sv,
+                        },
+                        refs,
+                    ))
+                }
+                None => {
+                    let fresh = fetch_row_json(tx, table, pk, &op.entity_id).await?;
+                    Ok((
+                        match fresh {
+                            Some(server_row) => PushResultStatus::Conflict {
+                                entity_id: op.entity_id.clone(),
+                                server_row,
+                            },
+                            None => PushResultStatus::Applied {
+                                entity_id: op.entity_id.clone(),
+                                new_sync_version: op.sync_version,
+                            },
+                        },
+                        no_refs,
+                    ))
+                }
+            }
         }
     }
 }
@@ -405,17 +482,21 @@ async fn generic_update(
     entity_id: &str,
     payload: &Value,
     user_id: i64,
-) -> ApiResult<i64> {
+    expected_sync_version: i64,
+) -> ApiResult<Option<i64>> {
     use crate::handlers::sync_helpers as h;
-    h::update_from_payload(tx, entity, entity_id, payload, user_id).await
+    h::update_from_payload(tx, entity, entity_id, payload, user_id, expected_sync_version).await
 }
 
+/// Version-guarded tombstone. None = the guard matched no row (concurrent
+/// writer won, or the row vanished) — caller re-reads and reports.
 async fn soft_delete(
     tx: &mut Transaction<'_, Postgres>,
     entity: EntityType,
     entity_id: &str,
     user_id: i64,
-) -> ApiResult<i64> {
+    expected_sync_version: i64,
+) -> ApiResult<Option<i64>> {
     let table = entity.table_name();
     let pk = entity.pk_column();
     let q = format!(
@@ -425,16 +506,17 @@ async fn soft_delete(
                updated_at = now(),
                updated_by_user_id = $1,
                sync_version = sync_version + 1
-         WHERE {pk}::text = $2
+         WHERE {pk}::text = $2 AND sync_version = $3
          RETURNING sync_version
         "#
     );
-    let (sv,): (i64,) = sqlx::query_as(&q)
+    let sv: Option<(i64,)> = sqlx::query_as(&q)
         .bind(user_id)
         .bind(entity_id)
-        .fetch_one(&mut **tx)
+        .bind(expected_sync_version)
+        .fetch_optional(&mut **tx)
         .await?;
-    Ok(sv)
+    Ok(sv.map(|t| t.0))
 }
 
 /// Cursor-based incremental pull with a composite (updated_at, pk) keyset.

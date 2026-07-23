@@ -4,7 +4,7 @@ use sqlx::PgPool;
 
 use super::cache::CacheManager;
 use super::client::FalconClient;
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
 
 pub const FALCON_INVOICES_PATH: &str = "/api/service-invoices";
 pub const FALCON_INVOICE_SEARCH_PATH: &str = "/api/service-invoices/search";
@@ -167,14 +167,22 @@ async fn upsert_invoices_page(pool: &PgPool, page_rows: &[Value]) -> ApiResult<(
             .and_then(|x| x.as_str())
             .map(str::to_string);
 
-        // Decide "known" by comparing existing raw_payload — cheap heuristic.
-        let existed: Option<(i32,)> =
-            sqlx::query_as("SELECT id FROM service_invoices_cache WHERE id = $1")
+        // "Known" = exists AND unchanged. Existence alone made the
+        // incremental sweep stop at the first page of familiar ids, so a
+        // Falcon-side edit to any invoice older than the newest page was
+        // never re-fetched. Comparing raw_payload keeps the sweep walking
+        // past pages that contain upstream edits. (serde_json object
+        // equality is key-order-insensitive, so jsonb normalization does
+        // not cause false mismatches.)
+        let existed: Option<(Value,)> =
+            sqlx::query_as("SELECT raw_payload FROM service_invoices_cache WHERE id = $1")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if existed.is_none() {
-            all_known = false;
+        match &existed {
+            None => all_known = false,
+            Some((stored,)) if stored != inv => all_known = false,
+            _ => {}
         }
 
         sqlx::query(
@@ -253,4 +261,3 @@ async fn upsert_invoices_page(pool: &PgPool, page_rows: &[Value]) -> ApiResult<(
     Ok((inserted, all_known))
 }
 
-pub fn _ensure_used(_e: ApiError) {} // placeholder to satisfy unused import warnings if any

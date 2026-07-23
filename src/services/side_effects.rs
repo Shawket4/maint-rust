@@ -53,6 +53,26 @@ pub fn normalize_insert(entity: EntityType, payload: &mut Value) {
     }
 }
 
+/// Rewrite server-owned derived fields before an UPDATE. The oil flag is
+/// server authority: a client-sent `flagged` is stripped, and when the update
+/// touches `liters` the flag is recomputed from the new value — otherwise an
+/// update from 35 L to 50 L would sail through still unflagged.
+///
+/// NOTE (accepted drift): editing or deleting an oil change does NOT adjust
+/// the stock ledger — movements are append-only and mirrored to Falcon, whose
+/// debit endpoint has no compensation contract. Corrections are entered as
+/// manual stock credits on the dashboard.
+pub fn normalize_update(entity: EntityType, payload: &mut Value) {
+    if entity == EntityType::OilChanges {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("flagged");
+        }
+        if let Some(l) = payload.get("liters").and_then(as_f64) {
+            payload["flagged"] = Value::Bool(oil_flagged(l));
+        }
+    }
+}
+
 /// Run inside the op's savepoint after a successful apply.
 /// `row_before` is the row as it existed before this op (None for inserts).
 /// Returns the ref_ids of stock movements recorded, for post-commit mirroring.
@@ -108,20 +128,70 @@ pub async fn after_apply(
             }
         }
 
-        // A mount marks the tire mounted.
+        // A mount marks the tire mounted — unless the inserted assignment is
+        // ALREADY CLOSED (legacy onboarding history, or a client outbox that
+        // coalesced mount+dismount into one insert): then the dismount
+        // derivation applies instead, or the tire would stick 'mounted'.
         (EntityType::TireAssignments, SyncOperation::Insert) => {
             if let Some(tire_id) = payload
                 .get("tire_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| Uuid::parse_str(s).ok())
             {
-                sqlx::query(
-                    "UPDATE tires SET status = 'mounted', updated_at = now(), \
-                     sync_version = sync_version + 1 WHERE id = $1 AND status <> 'mounted'",
-                )
-                .bind(tire_id)
-                .execute(&mut **tx)
-                .await?;
+                let closed = payload
+                    .get("dismounted_at")
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false);
+                if closed {
+                    let reason = payload
+                        .get("dismount_reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("other");
+                    sqlx::query(
+                        "UPDATE tires SET status = $2::tire_status, updated_at = now(), \
+                         sync_version = sync_version + 1 WHERE id = $1",
+                    )
+                    .bind(tire_id)
+                    .bind(dismount_status(reason))
+                    .execute(&mut **tx)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE tires SET status = 'mounted', updated_at = now(), \
+                         sync_version = sync_version + 1 WHERE id = $1 AND status <> 'mounted'",
+                    )
+                    .bind(tire_id)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+            }
+        }
+
+        // A lifecycle event (repair out/in, retread, restock, scrap) DERIVES
+        // the tire's status server-side. The client enqueues only the event —
+        // never a competing `tires` update, which would carry a base
+        // sync_version made stale by these very derivations and dead-letter.
+        (EntityType::TireStatusEvents, SyncOperation::Insert) => {
+            if let (Some(tire_id), Some(to_status)) = (
+                payload
+                    .get("tire_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok()),
+                payload.get("to_status").and_then(|v| v.as_str()),
+            ) {
+                // Never override 'mounted' from an event — mount state is the
+                // assignment projection's job.
+                if to_status != "mounted" {
+                    sqlx::query(
+                        "UPDATE tires SET status = $2::tire_status, updated_at = now(), \
+                         sync_version = sync_version + 1 \
+                          WHERE id = $1 AND status <> 'mounted' AND status <> $2::tire_status",
+                    )
+                    .bind(tire_id)
+                    .bind(to_status)
+                    .execute(&mut **tx)
+                    .await?;
+                }
             }
         }
 
@@ -158,6 +228,31 @@ pub async fn after_apply(
                     )
                     .bind(tire_id)
                     .bind(status)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+            }
+        }
+
+        // Tombstoning an OPEN assignment un-mounts the tire — otherwise the
+        // partial unique indexes free the position for re-use while the tire
+        // itself stays 'mounted' forever.
+        (EntityType::TireAssignments, SyncOperation::Delete) => {
+            let was_open = row_before
+                .and_then(|r| r.get("dismounted_at"))
+                .map(|v| v.is_null())
+                .unwrap_or(false);
+            if was_open {
+                if let Some(tire_id) = row_before
+                    .and_then(|r| r.get("tire_id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    sqlx::query(
+                        "UPDATE tires SET status = 'in_stock_used', updated_at = now(), \
+                         sync_version = sync_version + 1 WHERE id = $1 AND status = 'mounted'",
+                    )
+                    .bind(tire_id)
                     .execute(&mut **tx)
                     .await?;
                 }

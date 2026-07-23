@@ -457,3 +457,488 @@ async fn mount_from_shipment_debits_stock_and_dismount_derives_status_and_km() {
             .unwrap();
     assert_eq!(derived_km, 40_000, "lifetime km derived from the assignment history");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2026-07-23 review regressions
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn update_op(entity_type: EntityType, id: &str, payload: Value, sv: i64) -> PushOperation {
+    PushOperation {
+        entity_type,
+        entity_id: id.to_string(),
+        operation: SyncOperation::Update,
+        payload,
+        sync_version: sv,
+    }
+}
+
+fn delete_op(entity_type: EntityType, id: &str, sv: i64) -> PushOperation {
+    PushOperation {
+        entity_type,
+        entity_id: id.to_string(),
+        operation: SyncOperation::Delete,
+        payload: Value::Null,
+        sync_version: sv,
+    }
+}
+
+/// A delete acked into a dropped response is redelivered with its old base
+/// sync_version. That replay must ack as a no-op — before the fix it minted a
+/// conflict dead-letter for a delete that had already succeeded.
+#[tokio::test]
+async fn delete_replay_acks_as_noop_not_conflict() {
+    let Some(pool) = test_pool().await else { return };
+
+    let wo = Uuid::new_v4();
+    let (resp, _) =
+        apply_push_batch(&pool, &PushBody { operations: vec![wo_op(wo, "open")] }, 1)
+            .await
+            .unwrap();
+    let sv = match &resp.results[0] {
+        PushResultStatus::Applied { new_sync_version, .. } => *new_sync_version,
+        other => panic!("insert failed: {other:?}"),
+    };
+
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody { operations: vec![delete_op(EntityType::WorkOrders, &wo.to_string(), sv)] },
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }), "first delete applies");
+
+    // The ack is lost; the client redelivers the SAME delete with the SAME base.
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody { operations: vec![delete_op(EntityType::WorkOrders, &wo.to_string(), sv)] },
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(resp.results[0], PushResultStatus::Applied { .. }),
+        "replayed delete must no-op, not conflict: {:?}",
+        resp.results[0]
+    );
+}
+
+/// Soft-deleting a class assignment and then re-inserting it must resurrect
+/// the row — the upsert path used to leave deleted_at set, acking "applied"
+/// while the vehicle stayed invisible to v_maintenance_due forever.
+#[tokio::test]
+async fn singleton_reinsert_resurrects_tombstoned_class_assignment() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+    let class_id = format!("test-class-{}", &Uuid::new_v4().to_string()[..8]);
+    sqlx::query("INSERT INTO vehicle_classes (id, name_ar, name_en) VALUES ($1, 'اختبار', 'Test')")
+        .bind(&class_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let assign = |sv: i64| PushOperation {
+        entity_type: EntityType::VehicleClassAssignments,
+        entity_id: vid.to_string(),
+        operation: SyncOperation::Insert,
+        payload: json!({ "vehicle_id": vid, "class_id": class_id }),
+        sync_version: sv,
+    };
+
+    let (resp, _) =
+        apply_push_batch(&pool, &PushBody { operations: vec![assign(0)] }, 1).await.unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }));
+    let sv: i64 = sqlx::query_scalar(
+        "SELECT sync_version FROM vehicle_class_assignments WHERE vehicle_id = $1",
+    )
+    .bind(vid as i32)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody {
+            operations: vec![delete_op(EntityType::VehicleClassAssignments, &vid.to_string(), sv)],
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }), "delete applies");
+
+    let (resp, _) =
+        apply_push_batch(&pool, &PushBody { operations: vec![assign(0)] }, 1).await.unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }), "re-insert applies");
+
+    let deleted_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT deleted_at FROM vehicle_class_assignments WHERE vehicle_id = $1",
+    )
+    .bind(vid as i32)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(deleted_at.is_none(), "re-insert must clear the tombstone");
+}
+
+/// Inserting an assignment that is ALREADY CLOSED (legacy history, or a
+/// client outbox that coalesced mount+dismount) must derive the dismount
+/// status — before the fix the tire stuck 'mounted' forever.
+#[tokio::test]
+async fn insert_of_closed_assignment_derives_status_not_mounted() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+    let (_layout, pos) = seed_chassis(&pool, vid).await;
+
+    let tire = Uuid::new_v4();
+    let asg = Uuid::new_v4();
+    let body = PushBody {
+        operations: vec![
+            insert_op(
+                EntityType::Tires,
+                &tire.to_string(),
+                json!({
+                    "id": tire.to_string(),
+                    "brand": "B",
+                    "status": "in_stock_used",
+                    "origin": "legacy",
+                }),
+            ),
+            insert_op(
+                EntityType::TireAssignments,
+                &asg.to_string(),
+                json!({
+                    "id": asg.to_string(),
+                    "tire_id": tire.to_string(),
+                    "position_id": pos.to_string(),
+                    "vehicle_id": vid,
+                    "mounted_at": "2026-01-01T00:00:00Z",
+                    "mounted_odometer": 100_000,
+                    "mount_reason": "new",
+                    "dismounted_at": "2026-06-01T00:00:00Z",
+                    "dismounted_odometer": 130_000,
+                    "dismount_reason": "worn",
+                }),
+            ),
+        ],
+    };
+    let (resp, _) = apply_push_batch(&pool, &body, 1).await.unwrap();
+    assert!(matches!(resp.results[1], PushResultStatus::Applied { .. }));
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM tires WHERE id = $1")
+        .bind(tire)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "scrapped", "closed insert derives from the reason, never 'mounted'");
+}
+
+/// The oil flag is server authority on UPDATE too: changing liters recomputes
+/// it, and a client-sent flag is stripped — before the fix an update from
+/// 35 L to 50 L sailed through still unflagged.
+#[tokio::test]
+async fn oil_update_recomputes_flag_and_ignores_client_flag() {
+    let Some(pool) = test_pool().await else { return };
+
+    let oc = Uuid::new_v4();
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody {
+            operations: vec![insert_op(
+                EntityType::OilChanges,
+                &oc.to_string(),
+                json!({ "id": oc.to_string(), "vehicle_id": 901,
+                        "oil_type": format!("T-{}", &oc.to_string()[..8]), "liters": 35.0 }),
+            )],
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    let sv = match &resp.results[0] {
+        PushResultStatus::Applied { new_sync_version, .. } => *new_sync_version,
+        other => panic!("insert failed: {other:?}"),
+    };
+    let flagged: bool = sqlx::query_scalar("SELECT flagged FROM oil_changes WHERE id = $1")
+        .bind(oc)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!flagged, "35 L is inside the band");
+
+    // Update liters to 50, lying that it is unflagged.
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody {
+            operations: vec![update_op(
+                EntityType::OilChanges,
+                &oc.to_string(),
+                json!({ "liters": 50.0, "flagged": false }),
+                sv,
+            )],
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }));
+    let flagged: bool = sqlx::query_scalar("SELECT flagged FROM oil_changes WHERE id = $1")
+        .bind(oc)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(flagged, "server recomputes the flag from the new liters");
+}
+
+/// A tire lifecycle event (repair/retread/restock/scrap) derives tires.status
+/// server-side — the client enqueues only the event, never a competing tires
+/// update (whose base sync_version the derivations would make stale).
+#[tokio::test]
+async fn status_event_insert_derives_tire_status() {
+    let Some(pool) = test_pool().await else { return };
+
+    let tire = Uuid::new_v4();
+    let ev = Uuid::new_v4();
+    let body = PushBody {
+        operations: vec![
+            insert_op(
+                EntityType::Tires,
+                &tire.to_string(),
+                json!({ "id": tire.to_string(), "brand": "B",
+                        "status": "in_stock_used", "origin": "legacy" }),
+            ),
+            insert_op(
+                EntityType::TireStatusEvents,
+                &ev.to_string(),
+                json!({
+                    "id": ev.to_string(),
+                    "tire_id": tire.to_string(),
+                    "event_type": "retread",
+                    "from_status": "in_stock_used",
+                    "to_status": "retreading",
+                    "occurred_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            ),
+        ],
+    };
+    let (resp, _) = apply_push_batch(&pool, &body, 1).await.unwrap();
+    assert!(matches!(resp.results[1], PushResultStatus::Applied { .. }));
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM tires WHERE id = $1")
+        .bind(tire)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "retreading", "event insert projects the status server-side");
+}
+
+/// The ack is keyed on entity_id, so the inserted row must land under it even
+/// when the payload lies about (or omits) its own id — before the fix the row
+/// landed under a table-default UUID and every redelivery re-inserted it.
+#[tokio::test]
+async fn insert_lands_under_the_acked_entity_id_despite_payload_mismatch() {
+    let Some(pool) = test_pool().await else { return };
+
+    let real = Uuid::new_v4();
+    let liar = Uuid::new_v4();
+    let op = insert_op(
+        EntityType::WorkOrders,
+        &real.to_string(),
+        json!({
+            "id": liar.to_string(), // contradicts entity_id
+            "vehicle_id": 901,
+            "status": "open",
+            "title": "id mismatch",
+        }),
+    );
+    let (resp, _) =
+        apply_push_batch(&pool, &PushBody { operations: vec![op] }, 1).await.unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }));
+
+    let under_real: i64 = sqlx::query_scalar("SELECT count(*) FROM work_orders WHERE id = $1")
+        .bind(real)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let under_liar: i64 = sqlx::query_scalar("SELECT count(*) FROM work_orders WHERE id = $1")
+        .bind(liar)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((under_real, under_liar), (1, 0), "row lands under the acked id");
+}
+
+/// A stale update must conflict and carry the server row — and the guarded
+/// UPDATE (sync_version in the WHERE clause) is what makes this hold even
+/// when the competing writer commits between our read and our write.
+#[tokio::test]
+async fn stale_update_conflicts_and_reports_server_row() {
+    let Some(pool) = test_pool().await else { return };
+
+    let wo = Uuid::new_v4();
+    let (resp, _) =
+        apply_push_batch(&pool, &PushBody { operations: vec![wo_op(wo, "open")] }, 1)
+            .await
+            .unwrap();
+    let sv = match &resp.results[0] {
+        PushResultStatus::Applied { new_sync_version, .. } => *new_sync_version,
+        other => panic!("insert failed: {other:?}"),
+    };
+
+    // Device A updates (bumps the version).
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody {
+            operations: vec![update_op(
+                EntityType::WorkOrders,
+                &wo.to_string(),
+                json!({ "title": "device A" }),
+                sv,
+            )],
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }));
+
+    // Device B pushes with the old base.
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody {
+            operations: vec![update_op(
+                EntityType::WorkOrders,
+                &wo.to_string(),
+                json!({ "title": "device B" }),
+                sv,
+            )],
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    match &resp.results[0] {
+        PushResultStatus::Conflict { server_row, .. } => {
+            assert_eq!(
+                server_row.get("title").and_then(|v| v.as_str()),
+                Some("device A"),
+                "conflict carries the winning row"
+            );
+        }
+        other => panic!("stale update must conflict, got {other:?}"),
+    }
+    let title: String = sqlx::query_scalar("SELECT title FROM work_orders WHERE id = $1")
+        .bind(wo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(title, "device A", "the loser must not overwrite the winner");
+}
+
+/// Due-clock rules (0017): only DONE tasks reset the clock, and a mileage
+/// plan whose latest record has no odometer is 'never_done', not silently
+/// 'ok' forever.
+#[tokio::test]
+async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+
+    let class_id = format!("test-class-{}", &Uuid::new_v4().to_string()[..8]);
+    sqlx::query("INSERT INTO vehicle_classes (id, name_ar, name_en) VALUES ($1, 'اختبار', 'Test')")
+        .bind(&class_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO vehicle_class_assignments (vehicle_id, class_id, created_by_user_id, updated_by_user_id)
+         VALUES ($1, $2, 1, 1)",
+    )
+    .bind(vid as i32)
+    .bind(&class_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let plan: Uuid = sqlx::query_scalar(
+        "INSERT INTO service_plans (class_id, category_id, trigger_type, interval_km, created_by_user_id, updated_by_user_id)
+         VALUES ($1, 'oil_change', 'mileage', 10000, 1, 1) RETURNING id",
+    )
+    .bind(&class_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    async fn due_status(pool: &PgPool, plan: Uuid, vid: i64) -> String {
+        sqlx::query_scalar(
+            "SELECT status FROM v_maintenance_due WHERE plan_id = $1 AND vehicle_id = $2",
+        )
+        .bind(plan)
+        .bind(vid as i32)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    assert_eq!(due_status(&pool, plan, vid).await, "never_done", "no record yet");
+
+    // A WO with an UNDONE oil task must NOT reset the clock.
+    let wo = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO work_orders (id, vehicle_id, status, odometer_at_open, created_by_user_id, updated_by_user_id)
+         VALUES ($1, $2, 'closed', 500000, 1, 1)",
+    )
+    .bind(wo)
+    .bind(vid as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let task = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO work_order_tasks (id, work_order_id, kind, category_id, description_ar, is_done, created_by_user_id, updated_by_user_id)
+         VALUES ($1, $2, 'planned', 'oil_change', 'غيار زيت', false, 1, 1)",
+    )
+    .bind(task)
+    .bind(wo)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        due_status(&pool, plan, vid).await,
+        "never_done",
+        "an undone task must not count as performed"
+    );
+
+    // Marking it done resets the clock.
+    sqlx::query("UPDATE work_order_tasks SET is_done = true, updated_at = now() WHERE id = $1")
+        .bind(task)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_ne!(due_status(&pool, plan, vid).await, "never_done", "done task resets the clock");
+
+    // A LATER record with no odometer erases the km baseline → never_done
+    // again (not a silent forever-'ok').
+    let wo2 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO work_orders (id, vehicle_id, status, odometer_at_open, opened_at, created_by_user_id, updated_by_user_id)
+         VALUES ($1, $2, 'closed', NULL, now() + interval '1 hour', 1, 1)",
+    )
+    .bind(wo2)
+    .bind(vid as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO work_order_tasks (id, work_order_id, kind, category_id, description_ar, is_done, created_by_user_id, updated_by_user_id)
+         VALUES ($1, $2, 'planned', 'oil_change', 'غيار زيت', true, 1, 1)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(wo2)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        due_status(&pool, plan, vid).await,
+        "never_done",
+        "latest record without km = no usable baseline for a mileage plan"
+    );
+}

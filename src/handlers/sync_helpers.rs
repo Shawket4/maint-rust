@@ -154,6 +154,12 @@ pub async fn insert_from_payload(
         }
         updates.push("updated_at = now()".to_string());
         updates.push(format!("sync_version = {table}.sync_version + 1"));
+        if entity.has_deleted_at() {
+            // A re-insert of a tombstoned singleton is a resurrection. Without
+            // this, the upsert acks "applied" while the row stays soft-deleted
+            // and invisible to every view that filters deleted_at.
+            updates.push("deleted_at = NULL".to_string());
+        }
         q.push_str(&updates.join(", "));
     }
     q.push_str(" RETURNING sync_version");
@@ -177,13 +183,22 @@ pub async fn insert_from_payload(
     Ok(sv)
 }
 
+/// Guarded update: the expected sync_version is part of the UPDATE's WHERE
+/// clause, not just a pre-read compare. The pre-read runs on a plain SELECT
+/// (no FOR UPDATE), so under READ COMMITTED a concurrent batch can commit
+/// between the read and this statement — the predicate makes that window
+/// lose cleanly (0 rows → caller reports Conflict) instead of silently
+/// overwriting the winner.
+///
+/// Returns None when no row matched (version raced or row vanished).
 pub async fn update_from_payload(
     tx: &mut Transaction<'_, Postgres>,
     entity: EntityType,
     entity_id: &str,
     payload: &Value,
     user_id: i64,
-) -> ApiResult<i64> {
+    expected_sync_version: i64,
+) -> ApiResult<Option<i64>> {
     let table = entity.table_name();
     let pk = entity.pk_column();
     let cols = writable_columns(entity);
@@ -212,13 +227,14 @@ pub async fn update_from_payload(
 
     let set_sql = sets.join(", ");
     let q = format!(
-        "UPDATE {table} SET {set_sql} WHERE {pk}::text = $3 RETURNING sync_version"
+        "UPDATE {table} SET {set_sql} WHERE {pk}::text = $3 AND sync_version = $4 RETURNING sync_version"
     );
-    let (sv,): (i64,) = sqlx::query_as(&q)
+    let sv: Option<(i64,)> = sqlx::query_as(&q)
         .bind(payload)
         .bind(user_id)
         .bind(entity_id)
-        .fetch_one(&mut **tx)
+        .bind(expected_sync_version)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(db) if db.is_check_violation() => {
@@ -229,5 +245,5 @@ pub async fn update_from_payload(
             }
             _ => ApiError::Db(e),
         })?;
-    Ok(sv)
+    Ok(sv.map(|t| t.0))
 }

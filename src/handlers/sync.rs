@@ -19,14 +19,15 @@ async fn sync_push(
     // Per §7.2 each operation is independent: applied / conflict / error per row.
     // apply_push_batch wraps every op in a SAVEPOINT so a constraint violation
     // rolls back only its own op instead of aborting the whole batch.
-    let (resp, debit_refs) =
+    let (resp, _debit_refs) =
         apply_push_batch(&state.pool, &body.into_inner(), claims.user_id).await?;
     // Stock movements derived while applying (oil changes, mounts from stock)
     // are mirrored up to Falcon AFTER the commit — best-effort, idempotent on
-    // ref_id, retried later via `mirrored_to_falcon_at IS NULL` when it fails.
-    if !debit_refs.is_empty() {
-        stock_ledger::mirror_debits(&state, &token.0, &debit_refs).await;
-    }
+    // ref_id. The unmirrored sweep also replays any backlog whose earlier
+    // mirror attempt failed (this call IS the "retried later" the marker
+    // column promises — one indexed SELECT when the backlog is empty; the
+    // fresh refs from this batch are part of the unmirrored set).
+    stock_ledger::mirror_unmirrored(&state, &token.0).await;
     Ok(HttpResponse::Ok().json(resp))
 }
 
