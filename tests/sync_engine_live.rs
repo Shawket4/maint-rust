@@ -245,12 +245,19 @@ async fn pull_pages_through_identical_timestamps_without_skipping() {
     }
     tx.commit().await.unwrap();
 
-    // Page through with limit 2 using the composite cursor.
+    // Page through with limit 2 using the composite cursor. Drain FULLY
+    // (loop until !has_more) — the shared test DB accumulates work_order_tasks
+    // across runs, and a fixed page cap would stop before reaching this test's
+    // freshly-inserted rows (they sort last by updated_at). The safety bound
+    // just prevents an infinite loop if the pager ever regresses.
     let epoch = chrono::TimeZone::timestamp_opt(&chrono::Utc, 0, 0).unwrap();
     let mut since = epoch;
     let mut after_id: Option<String> = None;
     let mut seen: Vec<String> = Vec::new();
-    for _ in 0..40 {
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        assert!(guard < 100_000, "pager did not terminate");
         let page = pull_rows(&pool, EntityType::WorkOrderTasks, since, after_id.as_deref(), 2)
             .await
             .unwrap();
