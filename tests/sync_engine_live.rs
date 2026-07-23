@@ -894,7 +894,7 @@ async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
     let task = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO work_order_tasks (id, work_order_id, kind, category_id, description_ar, is_done, created_by_user_id, updated_by_user_id)
-         VALUES ($1, $2, 'planned', 'oil_change', 'غيار زيت', false, 1, 1)",
+         VALUES ($1, $2, 'free', 'oil_change', 'غيار زيت', false, 1, 1)",
     )
     .bind(task)
     .bind(wo)
@@ -929,7 +929,7 @@ async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
     .unwrap();
     sqlx::query(
         "INSERT INTO work_order_tasks (id, work_order_id, kind, category_id, description_ar, is_done, created_by_user_id, updated_by_user_id)
-         VALUES ($1, $2, 'planned', 'oil_change', 'غيار زيت', true, 1, 1)",
+         VALUES ($1, $2, 'free', 'oil_change', 'غيار زيت', true, 1, 1)",
     )
     .bind(Uuid::new_v4())
     .bind(wo2)
@@ -1104,4 +1104,30 @@ async fn mounted_tire_km_is_live_with_the_odometer_in_the_view() {
         .await
         .unwrap();
     assert_eq!(km, 85_000);
+}
+
+/// API fuzzing (schemathesis) found these: a malformed op must be a clean
+/// per-op error, never a 500 / server crash. An array/scalar payload used to
+/// panic serde_json's IndexMut and take the whole server down.
+#[tokio::test]
+async fn malformed_payload_is_a_per_op_error_not_a_crash() {
+    let Some(pool) = test_pool().await else { return };
+    let id = Uuid::new_v4();
+    for bad in [json!([null, null]), json!("scalar"), json!(42), Value::Null] {
+        let op = PushOperation {
+            entity_type: EntityType::WorkOrders,
+            entity_id: id.to_string(),
+            operation: SyncOperation::Insert,
+            payload: bad.clone(),
+            sync_version: 0,
+        };
+        let (resp, _) = apply_push_batch(&pool, &PushBody { operations: vec![op] }, 1)
+            .await
+            .expect("batch must not error out — the op is bad, not the batch");
+        assert!(
+            matches!(resp.results[0], PushResultStatus::Error { .. }),
+            "payload {bad:?} must be a per-op Error, got {:?}",
+            resp.results[0]
+        );
+    }
 }

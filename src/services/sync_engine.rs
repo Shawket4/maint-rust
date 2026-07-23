@@ -203,6 +203,18 @@ pub async fn apply_push_batch(
     Ok((PushResponse { results }, debit_refs))
 }
 
+/// Postgres text and jsonb both reject the NUL byte (U+0000) — a client
+/// sending one in any string field would 500 at the encoding layer (found by
+/// API fuzzing). Recurse the payload so the op dead-letters cleanly instead.
+fn json_has_nul(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(a) => a.iter().any(json_has_nul),
+        Value::Object(o) => o.keys().any(|k| k.contains('\0')) || o.values().any(json_has_nul),
+        _ => false,
+    }
+}
+
 /// Apply a single push operation inside an existing transaction.
 ///
 /// Returns the per-op result (applied / conflict / error). Errors are returned
@@ -221,6 +233,19 @@ pub async fn apply_push_operation(
     let row_now = fetch_row_json(tx, table, pk, &op.entity_id).await?;
 
     let no_refs: Vec<Uuid> = Vec::new();
+
+    // A NUL byte anywhere in the payload can't be stored (text/jsonb) — reject
+    // the op, never crash the batch.
+    if json_has_nul(&op.payload) {
+        return Ok((
+            PushResultStatus::Error {
+                entity_id: op.entity_id.clone(),
+                message: "payload contains a NUL byte".into(),
+            },
+            no_refs,
+        ));
+    }
+
     match op.operation {
         SyncOperation::Insert => {
             if row_now.is_some() && !op.entity_type.upserts_on_conflict() {
@@ -254,8 +279,21 @@ pub async fn apply_push_operation(
                     no_refs,
                 ));
             }
+            // A payload MUST be a JSON object — anything else (array, scalar)
+            // is a malformed op. serde_json's IndexMut below panics on a
+            // non-object, so reject cleanly here (found by API fuzzing: an
+            // array payload crashed the whole server).
+            let Some(obj) = op.payload.as_object() else {
+                return Ok((
+                    PushResultStatus::Error {
+                        entity_id: op.entity_id.clone(),
+                        message: "payload must be a JSON object".into(),
+                    },
+                    no_refs,
+                ));
+            };
             // Server-owned derived fields (e.g. the oil flag) override the client.
-            let mut payload = op.payload.clone();
+            let mut payload = Value::Object(obj.clone());
             // The ack is keyed on entity_id, so the row MUST land under it. A
             // payload missing or contradicting its own PK would otherwise
             // insert under a table-default UUID — acked under an id it doesn't

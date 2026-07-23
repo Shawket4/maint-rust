@@ -6,3 +6,12 @@
 .vscode
 .idea
 .sqlx
+
+# fuzzing
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock
+/.fuzzvenv
+/proptest-regressions
+/.schemathesis

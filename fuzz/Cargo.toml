@@ -1,0 +1,32 @@
+[package]
+name = "maint-rust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+maint-rust = { path = "..", package = "maint-rust" }
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "push_payload"
+path = "fuzz_targets/push_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oil_flag"
+path = "fuzz_targets/oil_flag.rs"
+test = false
+doc = false
+bench = false

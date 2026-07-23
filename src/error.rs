@@ -68,6 +68,7 @@ impl ApiError {
             Self::UpstreamFalcon { .. } => "upstream_falcon",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::UpstreamAuth => "upstream_auth",
+            Self::Db(e) if db_client_fault(e) => "bad_request",
             Self::Db(_) => "db_error",
             Self::Redis(_) => "redis_error",
             Self::Reqwest(_) => "reqwest_error",
@@ -75,6 +76,23 @@ impl ApiError {
             Self::Anyhow(_) => "internal",
         }
     }
+}
+
+/// A DB error whose SQLSTATE says the CLIENT sent bad data (class 22 data
+/// exception — e.g. 22021 NUL byte / bad encoding; class 23 integrity —
+/// FK/check/not-null). These must surface as 4xx, never a 500 `db_error`.
+/// (Unique violations, 23505, are excluded: the sync path maps those to a
+/// 409 Conflict deliberately, and a raw one is closer to a conflict than a
+/// bad request.) Discovered by API fuzzing: every one of these used to leak
+/// a 500 with a raw Postgres message.
+fn db_client_fault(e: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db) = e {
+        if let Some(code) = db.code() {
+            let class = &code[..2.min(code.len())];
+            return (class == "22" || class == "23") && code.as_ref() != "23505";
+        }
+    }
+    false
 }
 
 impl ResponseError for ApiError {
@@ -89,6 +107,7 @@ impl ResponseError for ApiError {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::Db(e) if db_client_fault(e) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -113,6 +132,9 @@ impl ResponseError for ApiError {
 
         // Log non-client errors loudly
         match self {
+            Self::Db(e) if db_client_fault(e) => {
+                tracing::debug!(error = %e, "client-fault db error (4xx)")
+            }
             Self::Db(e) => tracing::error!(error = %e, "db error"),
             Self::Redis(e) => tracing::warn!(error = %e, "redis error"),
             Self::Reqwest(e) => tracing::warn!(error = %e, "upstream reqwest error"),

@@ -313,4 +313,43 @@ mod tests {
         normalize_insert(EntityType::OilChanges, &mut p);
         assert_eq!(p["flagged"], serde_json::Value::Bool(false));
     }
+
+    // ── property-based (all inputs, not just the examples) ──────────────────
+
+    proptest::proptest! {
+        /// The oil flag is EXACTLY the inclusive 34–36 L band for every finite
+        /// input — no NaN/inf panics, no off-by-epsilon at the boundary.
+        #[test]
+        fn oil_flag_is_exactly_the_band(liters in -1.0e6f64..1.0e6) {
+            let flagged = oil_flagged(liters);
+            let inside = (OIL_FLAG_MIN..=OIL_FLAG_MAX).contains(&liters);
+            proptest::prop_assert_eq!(flagged, !inside);
+        }
+
+        /// dismount_status is total: every string maps to one of the five real
+        /// tire statuses, and unknown reasons fall to the used pool (never panic,
+        /// never an invalid enum the server's ::tire_status cast would reject).
+        #[test]
+        fn dismount_status_is_total_and_valid(reason in ".*") {
+            let s = dismount_status(&reason);
+            proptest::prop_assert!(
+                ["scrapped", "retreading", "in_repair", "in_stock_used"].contains(&s),
+                "invalid status {s} for reason {reason:?}"
+            );
+        }
+
+        /// normalize_insert/update are idempotent and always leave `flagged`
+        /// consistent with `liters` for an oil change (server authority).
+        #[test]
+        fn oil_normalization_is_idempotent_and_consistent(liters in 0.0f64..100.0) {
+            let mut p = serde_json::json!({ "liters": liters, "flagged": true });
+            normalize_insert(EntityType::OilChanges, &mut p);
+            let once = p.clone();
+            normalize_insert(EntityType::OilChanges, &mut p);
+            proptest::prop_assert_eq!(&once, &p, "normalize_insert not idempotent");
+            proptest::prop_assert_eq!(
+                &p["flagged"], &serde_json::Value::Bool(oil_flagged(liters))
+            );
+        }
+    }
 }

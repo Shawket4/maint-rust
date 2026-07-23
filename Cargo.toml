@@ -60,6 +60,9 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 dotenvy = "0.15"
 futures = "0.3"
 
+[dev-dependencies]
+proptest = "1"
+
 [profile.release]
 opt-level     = 3
 lto           = "thin"

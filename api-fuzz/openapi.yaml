@@ -1,0 +1,130 @@
+openapi: 3.0.3
+info:
+  title: maint-rust API (fuzz surface)
+  version: "0.1.0"
+  description: >
+    Hand-authored spec covering the GET read surface + the sync/reference write
+    endpoints for schemathesis property fuzzing. Not exhaustive of request
+    bodies — schemathesis's value here is hammering every GET with generated
+    query params / path ids and asserting the server never 500s, never returns
+    a non-JSON body, and honors its own error envelope. The two owned write
+    paths (/sync/push, /vehicle-classes) carry minimal schemas so stateful
+    fuzzing can reach them.
+servers:
+  - url: http://127.0.0.1:8090/api/maint
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+paths:
+  /health:
+    get:
+      security: []
+      summary: Liveness
+      responses: { "200": { description: ok }, "503": { description: degraded } }
+  /categories:
+    get: { summary: Maintenance categories, responses: { "200": { description: ok } } }
+  /vehicle-classes:
+    get: { summary: Vehicle classes, responses: { "200": { description: ok } } }
+    post:
+      summary: Create a vehicle class (perm >= 3)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, name_ar]
+              properties:
+                id: { type: string, example: "water_truck" }
+                name_ar: { type: string, example: "صهريج مياه" }
+                name_en: { type: string, nullable: true }
+                sort_order: { type: integer, nullable: true }
+      responses: { "200": { description: ok }, "403": { description: forbidden }, "400": { description: bad } }
+  /vehicle-class-assignments:
+    get: { summary: Class assignments, responses: { "200": { description: ok } } }
+  /vehicles:
+    get: { summary: Vehicles, responses: { "200": { description: ok } } }
+  /vehicles/{id}/service-events:
+    get:
+      summary: Live service events for a vehicle
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses: { "200": { description: ok } }
+  /service-plans:
+    get: { summary: Service plans, responses: { "200": { description: ok } } }
+    post:
+      summary: Upsert a service plan (perm >= 3)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [class_id, category_id, trigger_type]
+              properties:
+                class_id: { type: string }
+                category_id: { type: string }
+                trigger_type: { type: string, enum: [mileage, time] }
+                interval_km: { type: integer, nullable: true }
+                interval_days: { type: integer, nullable: true }
+                is_active: { type: boolean, nullable: true }
+      responses: { "200": { description: ok }, "403": { description: forbidden } }
+  /due:
+    get: { summary: Maintenance due board, responses: { "200": { description: ok } } }
+  /tires:
+    get: { summary: Tires list, responses: { "200": { description: ok } } }
+  /tires/{id}/history:
+    get:
+      summary: Tire lifecycle history
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses: { "200": { description: ok } }
+  /work-orders:
+    get: { summary: Work orders, responses: { "200": { description: ok } } }
+  /work-orders/{id}:
+    get:
+      summary: Work order detail
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses: { "200": { description: ok }, "404": { description: not found } }
+  /stock/tires:
+    get: { summary: Tire stock, responses: { "200": { description: ok } } }
+  /stock/oil:
+    get: { summary: Oil stock, responses: { "200": { description: ok } } }
+  /sync/pull:
+    get:
+      summary: Pull owned rows by composite cursor
+      parameters:
+        - { name: entity_type, in: query, required: true, schema: { type: string, enum: [work_orders, work_order_tasks, oil_changes, tires, tire_assignments, tire_status_events, chassis_layouts, chassis_axles, chassis_positions, vehicle_class_assignments, vehicle_odometer_overrides] } }
+        - { name: since, in: query, required: false, schema: { type: string } }
+        - { name: after_id, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer } }
+      responses: { "200": { description: ok } }
+  /sync/push:
+    post:
+      summary: Push owned ops
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [operations]
+              properties:
+                operations:
+                  type: array
+                  items:
+                    type: object
+                    required: [entity_type, entity_id, operation, payload, sync_version]
+                    properties:
+                      entity_type: { type: string, enum: [work_orders, tires] }
+                      entity_id: { type: string, format: uuid }
+                      operation: { type: string, enum: [insert, update, delete] }
+                      payload: { type: object }
+                      sync_version: { type: integer }
+      responses: { "200": { description: ok } }

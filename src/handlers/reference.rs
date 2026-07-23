@@ -74,6 +74,9 @@ async fn create_vehicle_class(
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err(ApiError::BadRequest("class id must be ascii slug".into()));
     }
+    if inp.name_ar.contains('\0') || inp.name_en.as_deref().unwrap_or("").contains('\0') {
+        return Err(ApiError::BadRequest("names must not contain NUL bytes".into()));
+    }
     let row: (Value,) = sqlx::query_as(
         "INSERT INTO vehicle_classes (id, name_ar, name_en, sort_order)
          VALUES ($1, $2, COALESCE($3, $2), COALESCE($4, (SELECT COALESCE(MAX(sort_order),0)+1 FROM vehicle_classes)))

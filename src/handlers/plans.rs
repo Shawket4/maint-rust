@@ -40,6 +40,37 @@ async fn upsert_plan(
         return Err(ApiError::Forbidden("service plans require permission >= 3".into()));
     }
     let p = body.into_inner();
+    // Validate BEFORE the DB: an unknown trigger_type used to reach the
+    // `$3::plan_trigger` cast and 500 with a raw db_error (found by API
+    // fuzzing). Reject with a clean 400 instead, and enforce the mileage-XOR-
+    // time interval invariant here rather than relying on the table CHECK to
+    // surface as a 500.
+    match p.trigger_type.as_str() {
+        "mileage" => {
+            if p.interval_km.map_or(true, |v| v <= 0) {
+                return Err(ApiError::BadRequest(
+                    "mileage plan needs interval_km > 0".into(),
+                ));
+            }
+        }
+        "time" => {
+            if p.interval_days.map_or(true, |v| v <= 0) {
+                return Err(ApiError::BadRequest("time plan needs interval_days > 0".into()));
+            }
+        }
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "trigger_type must be 'mileage' or 'time', got '{other}'"
+            )));
+        }
+    }
+    if p.class_id.trim().is_empty() || p.category_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("class_id and category_id are required".into()));
+    }
+    // Postgres text rejects NUL bytes — reject at the boundary as a 400, not a 500.
+    if p.class_id.contains('\0') || p.category_id.contains('\0') {
+        return Err(ApiError::BadRequest("ids must not contain NUL bytes".into()));
+    }
     // Upsert on (class_id, category_id) — one plan per class+category.
     let row: (Value,) = sqlx::query_as(
         r#"
