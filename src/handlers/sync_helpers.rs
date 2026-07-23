@@ -122,7 +122,7 @@ pub async fn insert_from_payload(
     let mut value_exprs: Vec<String> = Vec::new();
 
     for col in cols {
-        if !payload.get(col).is_some() {
+        if payload.get(col).is_none() {
             continue;
         }
         col_list.push(col);
@@ -193,7 +193,7 @@ pub async fn update_from_payload(
         if *col == pk {
             continue;
         }
-        if !payload.get(col).is_some() {
+        if payload.get(col).is_none() {
             continue;
         }
         let cast = pg_cast(entity, col);

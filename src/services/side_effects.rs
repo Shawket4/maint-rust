@@ -135,7 +135,8 @@ pub async fn after_apply(
                 .unwrap_or(false);
             let closes = payload.get("dismounted_at").map(|v| !v.is_null()).unwrap_or(false);
             if was_open && closes {
-                let row: Option<(Uuid, Option<i32>, Option<i32>, Option<String>, bool)> =
+                type ClosedAssignmentRow = (Uuid, Option<i32>, Option<i32>, Option<String>, bool);
+                let row: Option<ClosedAssignmentRow> =
                     sqlx::query_as(
                         "SELECT ta.tire_id, ta.mounted_odometer, ta.dismounted_odometer, \
                                 ta.dismount_reason::text, COALESCE(cp.is_spare, false) \

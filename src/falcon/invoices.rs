@@ -39,6 +39,7 @@ pub async fn fetch_invoices_cached(
     Ok(v)
 }
 
+#[allow(clippy::too_many_arguments)] // thin passthrough of the Falcon search params
 pub async fn search_invoices(
     falcon: &FalconClient,
     cache: &CacheManager,
