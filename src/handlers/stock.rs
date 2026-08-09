@@ -215,7 +215,11 @@ async fn credit_oil(
 #[derive(Debug, Deserialize)]
 struct MovementsQuery {
     kind: Option<String>,
+    /// Inclusive lower bound on created_at (date or timestamp) — the
+    /// time-range filter. Absent = no lower bound.
+    from: Option<String>,
     limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[get("/stock/movements")]
@@ -224,12 +228,15 @@ async fn stock_movements(
     _claims: AuthClaims,
     q: web::Query<MovementsQuery>,
 ) -> ApiResult<HttpResponse> {
-    let limit = q.limit.unwrap_or(200).clamp(1, 500);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
     let kind_filter = match q.kind.as_deref() {
         Some("tire") => " AND m.kind IN ('tire_debit','tire_credit')",
         Some("oil") => " AND m.kind IN ('oil_debit','oil_credit')",
         _ => "",
     };
+    // `from` binds as $3 (Option → NULL when absent). A bad timestamp casts to
+    // a SQLSTATE-22 error, which error.rs maps to a clean 400, not a 500.
     let sql = format!(
         "SELECT jsonb_build_object(
              'id', m.id, 'kind', m.kind::text, 'brand', m.brand, 'model', m.model, 'size', m.size,
@@ -239,11 +246,16 @@ async fn stock_movements(
            FROM stock_movements m
            LEFT JOIN work_orders wo ON wo.id = m.work_order_id
            LEFT JOIN vehicles_cache v ON v.id = wo.vehicle_id
-          WHERE true{kind_filter}
-          ORDER BY m.created_at DESC
-          LIMIT $1"
+          WHERE ($3::timestamptz IS NULL OR m.created_at >= $3::timestamptz){kind_filter}
+          ORDER BY m.created_at DESC, m.id DESC
+          LIMIT $1 OFFSET $2"
     );
-    let rows: Vec<(Value,)> = sqlx::query_as(&sql).bind(limit).fetch_all(pool.get_ref()).await?;
+    let rows: Vec<(Value,)> = sqlx::query_as(&sql)
+        .bind(limit)
+        .bind(offset)
+        .bind(&q.from)
+        .fetch_all(pool.get_ref())
+        .await?;
     Ok(HttpResponse::Ok().json(rows.into_iter().map(|(v,)| v).collect::<Vec<_>>()))
 }
 
