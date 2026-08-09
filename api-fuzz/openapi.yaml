@@ -96,6 +96,13 @@ paths:
     get: { summary: Tire stock, responses: { "200": { description: ok } } }
   /stock/oil:
     get: { summary: Oil stock, responses: { "200": { description: ok } } }
+  /stock/movements:
+    get:
+      summary: Stock in/out ledger
+      parameters:
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [tire, oil] } }
+        - { name: limit, in: query, required: false, schema: { type: integer } }
+      responses: { "200": { description: ok } }
   /sync/pull:
     get:
       summary: Pull owned rows by composite cursor

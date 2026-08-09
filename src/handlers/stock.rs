@@ -153,6 +153,18 @@ async fn credit_tires(
     .bind(b.qty)
     .fetch_one(pool.get_ref())
     .await?;
+    // Log the credit as a movement so it shows in the in/out ledger (the enum
+    // always allowed tire_credit; the cache bump above just never recorded it).
+    let _ = sqlx::query(
+        "INSERT INTO stock_movements (kind, brand, model, size, qty, ref_id) \
+         VALUES ('tire_credit', $1, $2, $3, $4, gen_random_uuid())",
+    )
+    .bind(&b.brand)
+    .bind(&b.model)
+    .bind(&b.size)
+    .bind(b.qty)
+    .execute(pool.get_ref())
+    .await;
     Ok(HttpResponse::Ok().json(row.0))
 }
 
@@ -186,7 +198,53 @@ async fn credit_oil(
     .bind(b.liters)
     .fetch_one(pool.get_ref())
     .await?;
+    let _ = sqlx::query(
+        "INSERT INTO stock_movements (kind, oil_type, liters, ref_id) \
+         VALUES ('oil_credit', $1, $2, gen_random_uuid())",
+    )
+    .bind(&b.oil_type)
+    .bind(b.liters)
+    .execute(pool.get_ref())
+    .await;
     Ok(HttpResponse::Ok().json(row.0))
+}
+
+/// The in/out ledger: every recorded stock movement (debits from oil changes
+/// and shipment-tire mounts, credits from the dashboard), newest first, with
+/// the consuming work order's plate resolved. `kind` filters to tire | oil.
+#[derive(Debug, Deserialize)]
+struct MovementsQuery {
+    kind: Option<String>,
+    limit: Option<i64>,
+}
+
+#[get("/stock/movements")]
+async fn stock_movements(
+    pool: web::Data<PgPool>,
+    _claims: AuthClaims,
+    q: web::Query<MovementsQuery>,
+) -> ApiResult<HttpResponse> {
+    let limit = q.limit.unwrap_or(200).clamp(1, 500);
+    let kind_filter = match q.kind.as_deref() {
+        Some("tire") => " AND m.kind IN ('tire_debit','tire_credit')",
+        Some("oil") => " AND m.kind IN ('oil_debit','oil_credit')",
+        _ => "",
+    };
+    let sql = format!(
+        "SELECT jsonb_build_object(
+             'id', m.id, 'kind', m.kind::text, 'brand', m.brand, 'model', m.model, 'size', m.size,
+             'oil_type', m.oil_type, 'qty', m.qty, 'liters', m.liters,
+             'work_order_id', m.work_order_id, 'plate', v.car_no_plate,
+             'created_at', m.created_at, 'mirrored', (m.mirrored_to_falcon_at IS NOT NULL))
+           FROM stock_movements m
+           LEFT JOIN work_orders wo ON wo.id = m.work_order_id
+           LEFT JOIN vehicles_cache v ON v.id = wo.vehicle_id
+          WHERE true{kind_filter}
+          ORDER BY m.created_at DESC
+          LIMIT $1"
+    );
+    let rows: Vec<(Value,)> = sqlx::query_as(&sql).bind(limit).fetch_all(pool.get_ref()).await?;
+    Ok(HttpResponse::Ok().json(rows.into_iter().map(|(v,)| v).collect::<Vec<_>>()))
 }
 
 /// Dev-only: seed a batch of tire + oil stock so the garage has something to consume.
@@ -225,6 +283,7 @@ async fn dev_seed(state: web::Data<AppState>, pool: web::Data<PgPool>) -> ApiRes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(tire_stock)
         .service(oil_stock)
+        .service(stock_movements)
         .service(debit_stock)
         .service(credit_tires)
         .service(credit_oil)
