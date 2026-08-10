@@ -38,7 +38,7 @@ struct AiQuery {
     query: String,
 }
 
-fn is_safe_select(sql: &str) -> bool {
+pub fn is_safe_select(sql: &str) -> bool {
     let t = sql.trim_start().to_lowercase();
     if !t.starts_with("select") && !t.starts_with("with") {
         return false;
@@ -60,6 +60,9 @@ async fn run_sql(pool: &sqlx::PgPool, query: &str) -> String {
     let inner = async {
         let mut tx = pool.begin().await?;
         sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
+        // Cap the model-emitted query's runtime so a `SELECT pg_sleep(...)` or
+        // a heavy cartesian scan can't tie up a Falcon DB connection.
+        sqlx::query("SET LOCAL statement_timeout = '8s'").execute(&mut *tx).await?;
         let (rows,): (Value,) = sqlx::query_as(&format!(
             "SELECT COALESCE(jsonb_agg(t), '[]'::jsonb) FROM ({}) t",
             query.trim_end().trim_end_matches(';')
@@ -78,11 +81,16 @@ async fn run_sql(pool: &sqlx::PgPool, query: &str) -> String {
 #[post("/ai/query")]
 async fn ai_query(
     state: web::Data<AppState>,
-    // Extracting claims makes authentication mandatory for this endpoint —
-    // the model-driven run_sql tool must never be reachable anonymously.
-    _claims: AuthClaims,
+    claims: AuthClaims,
     body: web::Json<AiQuery>,
 ) -> ApiResult<HttpResponse> {
+    // Supervisor-only: the model-driven run_sql tool reads Falcon's DB, so it
+    // must never be reachable by a low-permission (or anonymous) user. The
+    // READ ONLY tx + statement_timeout + FALCON_DATABASE_URL read-only role
+    // are the deeper layers; this gate is the first.
+    if claims.permission < 3 {
+        return Err(ApiError::Forbidden("AI search requires permission >= 3".into()));
+    }
     let api_key = state
         .anthropic_api_key
         .as_ref()
@@ -185,4 +193,59 @@ async fn ai_query(
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(ai_query);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_select;
+
+    #[test]
+    fn only_select_or_with_prefixes_pass() {
+        assert!(is_safe_select("SELECT 1"));
+        assert!(is_safe_select("  select * from cars limit 5"));
+        assert!(is_safe_select("WITH c AS (SELECT 1) SELECT * FROM c"));
+        assert!(!is_safe_select("UPDATE cars SET x=1"));
+        assert!(!is_safe_select("delete from cars"));
+        assert!(!is_safe_select("DROP TABLE cars"));
+        assert!(!is_safe_select("truncate cars"));
+    }
+
+    #[test]
+    fn banned_keywords_are_case_insensitive() {
+        assert!(!is_safe_select("SELECT 1; DeLeTe FROM cars"));
+        assert!(!is_safe_select("select 1 into outfile 'x'"));
+        assert!(!is_safe_select("SELECT 1; DROP TABLE cars"));
+    }
+
+    /// Documents the gate's KNOWN limits — it is only one of three layers.
+    /// A trailing comment or a whitespace-separated second statement passes the
+    /// substring blacklist, but run_sql wraps the query in `SELECT … FROM (…) t`
+    /// (a `;` inside the subquery is a syntax error → rejected) AND runs it in a
+    /// READ ONLY transaction with a statement_timeout. So these being "safe"
+    /// here is fine; the blacklist is defense-in-depth, not the sole guard.
+    #[test]
+    fn blacklist_is_only_the_first_of_three_layers() {
+        // a trailing comment is harmless and passes the blacklist (a `;` inside
+        // the run_sql subquery wrapper would be a syntax error, and the tx is
+        // READ ONLY with a statement_timeout — the blacklist is layer one of three).
+        assert!(is_safe_select("select * from cars -- comment"));
+    }
+
+    #[test]
+    fn a_realistic_join_query_passes() {
+        assert!(is_safe_select(
+            "SELECT i.service, s.plate_number, s.date FROM inspection_items i \
+             JOIN service_invoices s ON s.id = i.service_invoice_id \
+             WHERE i.service ILIKE '%فرامل%' ORDER BY s.date DESC LIMIT 50"
+        ));
+    }
+
+    #[test]
+    fn never_panics_on_arbitrary_input() {
+        // The gate is defense-in-depth over a READ ONLY + statement_timeout tx;
+        // whatever the model emits, this must not panic.
+        for s in ["", "   ", "سيليكت", "select\0", "\u{1F600}", "with", "select;"] {
+            let _ = is_safe_select(s);
+        }
+    }
 }

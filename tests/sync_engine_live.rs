@@ -19,6 +19,7 @@ use maint_rust::services::sync_engine::{
     apply_push_batch, pull_rows, EntityType, PushBody, PushOperation, PushResultStatus,
     SyncOperation,
 };
+use maint_rust::services::stock_ledger::{record_debit, DebitSpec};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -1137,4 +1138,229 @@ async fn malformed_payload_is_a_per_op_error_not_a_crash() {
             resp.results[0]
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2026-08-09 production-readiness batch (backend test-gap audit)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Deleting an OPEN assignment must un-mount the tire (side_effects Delete arm):
+/// the partial unique index frees the position, so the tire must not stay
+/// 'mounted' forever.
+#[tokio::test]
+async fn delete_open_assignment_unmounts_the_tire() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+    let (_layout, pos) = seed_chassis(&pool, vid).await;
+    let tire = Uuid::new_v4();
+    let asg = Uuid::new_v4();
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody {
+            operations: vec![
+                insert_op(EntityType::Tires, &tire.to_string(),
+                    json!({"id": tire.to_string(), "brand": "B", "status": "in_stock_used", "origin": "legacy"})),
+                insert_op(EntityType::TireAssignments, &asg.to_string(),
+                    json!({"id": asg.to_string(), "tire_id": tire.to_string(), "position_id": pos.to_string(),
+                           "vehicle_id": vid, "mounted_at": chrono::Utc::now().to_rfc3339(),
+                           "mounted_odometer": 100_000, "mount_reason": "new"})),
+            ],
+        },
+        1,
+    ).await.unwrap();
+    assert!(matches!(resp.results[1], PushResultStatus::Applied { .. }));
+    let sv: i64 = sqlx::query_scalar("SELECT sync_version FROM tire_assignments WHERE id=$1")
+        .bind(asg).fetch_one(&pool).await.unwrap();
+
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody { operations: vec![delete_op(EntityType::TireAssignments, &asg.to_string(), sv)] },
+        1,
+    ).await.unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }), "delete applies");
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM tires WHERE id=$1")
+        .bind(tire).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "in_stock_used", "tombstoning an open mount un-mounts the tire");
+    // position is free again.
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tire_assignments WHERE position_id=$1 AND dismounted_at IS NULL AND deleted_at IS NULL")
+        .bind(pos).fetch_one(&pool).await.unwrap();
+    assert_eq!(active, 0);
+}
+
+/// A NUL byte inside a string field is a clean per-op error, never a 500 at the
+/// Postgres encoding layer — and a clean op in the same batch still applies.
+#[tokio::test]
+async fn nul_byte_in_a_string_field_is_a_per_op_error() {
+    let Some(pool) = test_pool().await else { return };
+    let bad = Uuid::new_v4();
+    let good = Uuid::new_v4();
+    let bad_op = insert_op(EntityType::WorkOrders, &bad.to_string(),
+        json!({"id": bad.to_string(), "vehicle_id": 901, "status": "open", "title": "a\u{0000}b"}));
+    let (resp, _) = apply_push_batch(
+        &pool,
+        &PushBody { operations: vec![bad_op, wo_op(good, "open")] },
+        1,
+    ).await.expect("NUL must not crash the batch");
+    match &resp.results[0] {
+        PushResultStatus::Error { message, .. } => assert!(message.contains("NUL")),
+        other => panic!("expected NUL per-op error, got {other:?}"),
+    }
+    assert!(matches!(resp.results[1], PushResultStatus::Applied { .. }), "clean op still applies");
+}
+
+/// An Insert whose row already exists at a version beyond the (0,1) lost-ack
+/// case is a real conflict carrying the server row.
+#[tokio::test]
+async fn insert_of_existing_row_with_diverged_version_conflicts() {
+    let Some(pool) = test_pool().await else { return };
+    let wo = Uuid::new_v4();
+    let (resp, _) = apply_push_batch(&pool, &PushBody { operations: vec![wo_op(wo, "open")] }, 1).await.unwrap();
+    let sv = match &resp.results[0] { PushResultStatus::Applied { new_sync_version, .. } => *new_sync_version, o => panic!("{o:?}") };
+    // update → sv becomes 2
+    let _ = apply_push_batch(&pool, &PushBody {
+        operations: vec![update_op(EntityType::WorkOrders, &wo.to_string(), json!({"title": "x"}), sv)] }, 1).await.unwrap();
+    // re-insert at sv 0 → (0,2) is neither equal nor lost-ack → Conflict.
+    let (resp, _) = apply_push_batch(&pool, &PushBody { operations: vec![wo_op(wo, "open")] }, 1).await.unwrap();
+    assert!(matches!(resp.results[0], PushResultStatus::Conflict { .. }), "diverged re-insert conflicts");
+}
+
+/// vehicle_odometer_overrides is a no-tombstone upsert singleton: a second
+/// insert upserts (odometer replaced, version bumped), and delete is refused.
+#[tokio::test]
+async fn override_upserts_and_delete_is_refused() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+    sqlx::query("INSERT INTO vehicles_cache (id, car_no_plate, raw_payload, fetched_at) VALUES ($1,'OV','{}'::jsonb,now())")
+        .bind(vid as i32).execute(&pool).await.unwrap();
+    let ov = |odo: i64| PushOperation {
+        entity_type: EntityType::VehicleOdometerOverrides,
+        entity_id: vid.to_string(),
+        operation: SyncOperation::Insert,
+        payload: json!({"vehicle_id": vid, "odometer": odo, "set_at": chrono::Utc::now().to_rfc3339()}),
+        sync_version: 0,
+    };
+    let (r, _) = apply_push_batch(&pool, &PushBody { operations: vec![ov(200_000)] }, 1).await.unwrap();
+    assert!(matches!(r.results[0], PushResultStatus::Applied { .. }));
+    let (r, _) = apply_push_batch(&pool, &PushBody { operations: vec![ov(250_000)] }, 1).await.unwrap();
+    assert!(matches!(r.results[0], PushResultStatus::Applied { .. }), "second insert upserts, not conflict");
+    let (odo, sv): (i32, i64) = sqlx::query_as("SELECT odometer, sync_version FROM vehicle_odometer_overrides WHERE vehicle_id=$1")
+        .bind(vid as i32).fetch_one(&pool).await.unwrap();
+    assert_eq!(odo, 250_000, "odometer replaced");
+    assert!(sv >= 2, "version bumped on upsert");
+    let (r, _) = apply_push_batch(&pool, &PushBody {
+        operations: vec![delete_op(EntityType::VehicleOdometerOverrides, &vid.to_string(), sv)] }, 1).await.unwrap();
+    match &r.results[0] {
+        PushResultStatus::Error { message, .. } => assert!(message.contains("does not support delete")),
+        o => panic!("delete must be refused, got {o:?}"),
+    }
+}
+
+/// Pull delivers soft-deleted rows as tombstones so a second device learns of
+/// the deletion.
+#[tokio::test]
+async fn pull_returns_soft_deleted_rows_as_tombstones() {
+    let Some(pool) = test_pool().await else { return };
+    let wo = Uuid::new_v4();
+    let (r, _) = apply_push_batch(&pool, &PushBody { operations: vec![wo_op(wo, "open")] }, 1).await.unwrap();
+    let sv = match &r.results[0] { PushResultStatus::Applied { new_sync_version, .. } => *new_sync_version, o => panic!("{o:?}") };
+    apply_push_batch(&pool, &PushBody { operations: vec![delete_op(EntityType::WorkOrders, &wo.to_string(), sv)] }, 1).await.unwrap();
+    let epoch = chrono::TimeZone::timestamp_opt(&chrono::Utc, 0, 0).unwrap();
+    let page = pull_rows(&pool, EntityType::WorkOrders, epoch, None, 500).await.unwrap();
+    let row = page.rows.iter().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(wo.to_string().as_str()));
+    let row = row.expect("deleted row must still be delivered");
+    assert!(row.get("deleted_at").map(|v| !v.is_null()).unwrap_or(false), "delivered with tombstone");
+}
+
+/// A restock event FROM the retreader increments retread_count (lineage).
+#[tokio::test]
+async fn restock_from_retreading_bumps_retread_count() {
+    let Some(pool) = test_pool().await else { return };
+    let tire = Uuid::new_v4();
+    let ev = Uuid::new_v4();
+    let (r, _) = apply_push_batch(&pool, &PushBody {
+        operations: vec![
+            insert_op(EntityType::Tires, &tire.to_string(),
+                json!({"id": tire.to_string(), "brand": "B", "status": "retreading", "origin": "legacy", "retread_count": 0})),
+            insert_op(EntityType::TireStatusEvents, &ev.to_string(),
+                json!({"id": ev.to_string(), "tire_id": tire.to_string(), "event_type": "restock",
+                       "from_status": "retreading", "to_status": "in_stock_used", "occurred_at": chrono::Utc::now().to_rfc3339()})),
+        ],
+    }, 1).await.unwrap();
+    assert!(matches!(r.results[1], PushResultStatus::Applied { .. }));
+    let (status, retreads): (String, i16) =
+        sqlx::query_as("SELECT status::text, retread_count FROM tires WHERE id=$1")
+            .bind(tire).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "in_stock_used");
+    assert_eq!(retreads, 1, "restock-from-retreading bumps the lineage counter");
+}
+
+/// The two Error arms of the Update branch: missing row + empty patch.
+#[tokio::test]
+async fn update_missing_row_and_empty_patch_are_errors() {
+    let Some(pool) = test_pool().await else { return };
+    let ghost = Uuid::new_v4();
+    let (r, _) = apply_push_batch(&pool, &PushBody {
+        operations: vec![update_op(EntityType::WorkOrders, &ghost.to_string(), json!({"title": "x"}), 1)] }, 1).await.unwrap();
+    match &r.results[0] { PushResultStatus::Error { message, .. } => assert!(message.contains("row not found")), o => panic!("{o:?}") };
+
+    let wo = Uuid::new_v4();
+    let (r, _) = apply_push_batch(&pool, &PushBody { operations: vec![wo_op(wo, "open")] }, 1).await.unwrap();
+    let sv = match &r.results[0] { PushResultStatus::Applied { new_sync_version, .. } => *new_sync_version, o => panic!("{o:?}") };
+    let (r, _) = apply_push_batch(&pool, &PushBody {
+        operations: vec![update_op(EntityType::WorkOrders, &wo.to_string(), json!({}), sv)] }, 1).await.unwrap();
+    match &r.results[0] { PushResultStatus::Error { message, .. } => assert!(message.contains("no updatable")), o => panic!("empty patch must error, got {o:?}") };
+}
+
+/// record_debit is idempotent on ref_id: a second call with the same ref_id
+/// returns false and mutates neither the ledger nor the cache.
+#[tokio::test]
+async fn record_debit_is_idempotent_on_ref_id() {
+    let Some(pool) = test_pool().await else { return };
+    let oil = format!("OILREF-{}", &Uuid::new_v4().to_string()[..8]);
+    sqlx::query("INSERT INTO oil_stock_cache (oil_type, liters_on_hand) VALUES ($1, 100) ON CONFLICT (oil_type) DO UPDATE SET liters_on_hand=100")
+        .bind(&oil).execute(&pool).await.unwrap();
+    let ref_id = Uuid::new_v4();
+    let spec = DebitSpec { kind: "oil_debit", brand: None, model: None, size: None,
+        oil_type: Some(oil.clone()), qty: None, liters: Some(40.0), ref_id, work_order_id: None };
+    let mut tx = pool.begin().await.unwrap();
+    assert!(record_debit(&mut tx, &spec).await.unwrap(), "first debit records");
+    assert!(!record_debit(&mut tx, &spec).await.unwrap(), "second is a no-op");
+    tx.commit().await.unwrap();
+    let (movements, left): (i64, f64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM stock_movements WHERE ref_id=$1), (SELECT liters_on_hand::float8 FROM oil_stock_cache WHERE oil_type=$2)")
+        .bind(ref_id).bind(&oil).fetch_one(&pool).await.unwrap();
+    assert_eq!(movements, 1, "exactly one movement despite two calls");
+    assert_eq!(left, 60.0, "debited once (100 − 40)");
+}
+
+/// /work-orders/{id} attributes a tire to BOTH the mount WO and the dismount WO
+/// (0012 dual attribution) — mirrors the handler's OR-join.
+#[tokio::test]
+async fn tire_work_is_attributed_to_both_mount_and_dismount_wo() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+    let (_layout, pos) = seed_chassis(&pool, vid).await;
+    let wo_a = Uuid::new_v4();
+    let wo_b = Uuid::new_v4();
+    for w in [wo_a, wo_b] {
+        sqlx::query("INSERT INTO work_orders (id, vehicle_id, status, created_by_user_id, updated_by_user_id) VALUES ($1,$2,'open',1,1)")
+            .bind(w).bind(vid as i32).execute(&pool).await.unwrap();
+    }
+    let tire = Uuid::new_v4();
+    sqlx::query("INSERT INTO tires (id, brand, status, origin, created_by_user_id, updated_by_user_id) VALUES ($1,'B','mounted','legacy',1,1)")
+        .bind(tire).execute(&pool).await.unwrap();
+    let asg = Uuid::new_v4();
+    // mount under A, dismount under B.
+    sqlx::query("INSERT INTO tire_assignments (id, tire_id, position_id, vehicle_id, work_order_id, dismount_work_order_id, mounted_at, dismounted_at, mount_reason, dismount_reason, created_by_user_id, updated_by_user_id)
+                 VALUES ($1,$2,$3,$4,$5,$6, now()-interval '1 day', now(), 'new', 'worn', 1, 1)")
+        .bind(asg).bind(tire).bind(pos).bind(vid as i32).bind(wo_a).bind(wo_b).execute(&pool).await.unwrap();
+    async fn count_for(pool: &PgPool, wo: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM tire_assignments a WHERE (a.work_order_id=$1 OR a.dismount_work_order_id=$1) AND a.deleted_at IS NULL")
+            .bind(wo).fetch_one(pool).await.unwrap()
+    }
+    assert_eq!(count_for(&pool, wo_a).await, 1, "appears in the mount WO");
+    assert_eq!(count_for(&pool, wo_b).await, 1, "appears in the dismount WO too");
 }

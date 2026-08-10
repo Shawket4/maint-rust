@@ -34,6 +34,9 @@ fuzz_target!(|data: &[u8]| {
             }
             let mut p2 = op.payload.clone();
             normalize_update(op.entity_type, &mut p2);
+            let upd_once = p2.clone();
+            normalize_update(op.entity_type, &mut p2);
+            assert_eq!(upd_once, p2, "normalize_update not idempotent");
         }
     }
 });

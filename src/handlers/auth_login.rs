@@ -42,7 +42,7 @@ async fn login(state: web::Data<AppState>, body: web::Json<LoginBody>) -> ApiRes
     // user_id must be a REAL Falcon user so the minted token also passes
     // FalconGo's Verify (it looks the user up by id) when maint-rust proxies
     // /api/cars. MAINT_DEV_USER_ID overrides; default 3 (perm-4 admin in prod).
-    if state.dev_login {
+    if cfg!(debug_assertions) && state.dev_login {
         let user_id = std::env::var("MAINT_DEV_USER_ID").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(3);
         let (jwt, exp) = token::mint(&state.jwt_secret, user_id, 4, "admin_user", 31)?;

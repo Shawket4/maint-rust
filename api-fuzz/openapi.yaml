@@ -49,12 +49,10 @@ paths:
     get: { summary: Class assignments, responses: { "200": { description: ok } } }
   /vehicles:
     get: { summary: Vehicles, responses: { "200": { description: ok } } }
-  /vehicles/{id}/service-events:
-    get:
-      summary: Live service events for a vehicle
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: integer } }
-      responses: { "200": { description: ok } }
+  # /vehicles/{id}/service-events and /ai/query are Falcon-Postgres passthroughs
+  # (they need FALCON_DATABASE_URL — a read-only conn to Falcon's DB). The fuzz
+  # harness runs WITHOUT Falcon, so they're deliberately outside this surface;
+  # their contract is exercised by the live suite against a real upstream.
   /service-plans:
     get: { summary: Service plans, responses: { "200": { description: ok } } }
     post:
@@ -101,8 +99,63 @@ paths:
       summary: Stock in/out ledger
       parameters:
         - { name: kind, in: query, required: false, schema: { type: string, enum: [tire, oil] } }
+        - { name: from, in: query, required: false, schema: { type: string } }
         - { name: limit, in: query, required: false, schema: { type: integer } }
-      responses: { "200": { description: ok } }
+        - { name: offset, in: query, required: false, schema: { type: integer } }
+      responses: { "200": { description: ok }, "400": { description: bad } }
+  /stock/tires/credit:
+    post:
+      summary: Credit tire stock (perm >= 4, idempotent on ref_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [brand, qty]
+              properties:
+                brand: { type: string, example: "Michelin" }
+                model: { type: string, nullable: true }
+                size: { type: string, nullable: true }
+                qty: { type: integer, example: 4 }
+                ref_id: { type: string, format: uuid, nullable: true }
+      responses: { "200": { description: ok }, "403": { description: forbidden }, "400": { description: bad } }
+  /stock/oil/credit:
+    post:
+      summary: Credit oil stock (perm >= 4, idempotent on ref_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [oil_type, liters]
+              properties:
+                oil_type: { type: string, example: "15W40" }
+                liters: { type: number, example: 200 }
+                ref_id: { type: string, format: uuid, nullable: true }
+      responses: { "200": { description: ok }, "403": { description: forbidden }, "400": { description: bad } }
+  /stock/debit:
+    post:
+      summary: Debit stock (idempotent on ref_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, ref_id]
+              properties:
+                kind: { type: string, enum: [tire_debit, oil_debit] }
+                brand: { type: string, nullable: true }
+                model: { type: string, nullable: true }
+                size: { type: string, nullable: true }
+                oil_type: { type: string, nullable: true }
+                qty: { type: integer, nullable: true }
+                liters: { type: number, nullable: true }
+                ref_id: { type: string, format: uuid }
+                work_order_id: { type: string, format: uuid, nullable: true }
+      responses: { "200": { description: ok }, "400": { description: bad } }
   /sync/pull:
     get:
       summary: Pull owned rows by composite cursor

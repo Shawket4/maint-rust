@@ -37,18 +37,13 @@ pub async fn record_debit(
     tx: &mut Transaction<'_, Postgres>,
     d: &DebitSpec,
 ) -> ApiResult<bool> {
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM stock_movements WHERE ref_id = $1")
-            .bind(d.ref_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    if exists.is_some() {
-        return Ok(false);
-    }
-
-    sqlx::query(
+    // Exactly-once, race-free: the unique index on ref_id (0018) + ON CONFLICT
+    // DO NOTHING means a concurrent/retried debit with the same ref_id inserts
+    // nothing and RETURNING yields no row — so we skip the decrement too.
+    let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO stock_movements (kind, brand, model, size, oil_type, qty, liters, work_order_id, ref_id) \
-         VALUES ($1::stock_move_kind,$2,$3,$4,$5,$6,$7,$8,$9)",
+         VALUES ($1::stock_move_kind,$2,$3,$4,$5,$6,$7,$8,$9) \
+         ON CONFLICT (ref_id) WHERE ref_id IS NOT NULL DO NOTHING RETURNING id",
     )
     .bind(d.kind)
     .bind(&d.brand)
@@ -59,8 +54,11 @@ pub async fn record_debit(
     .bind(d.liters)
     .bind(d.work_order_id)
     .bind(d.ref_id)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
+    if inserted.is_none() {
+        return Ok(false);
+    }
 
     match d.kind {
         "tire_debit" => {

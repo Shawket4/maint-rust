@@ -23,10 +23,17 @@ impl Config {
         // dotenvy is best-effort — if .env doesn't exist (prod/systemd) we don't fail.
         let _ = dotenvy::dotenv();
 
+        let jwt_secret = env::var("JWT_SECRET").context("JWT_SECRET must be set")?;
+        // Refuse to boot on the committed placeholder — a deploy that adopts it
+        // (e.g. `.env` auto-created from `.env.example`) would come up "healthy"
+        // while every real JWT 401s. Fail loud instead of shipping green-broken.
+        if jwt_secret == "must_match_falcon_jwt_secret" {
+            anyhow::bail!("JWT_SECRET is the placeholder — set the real Falcon secret");
+        }
         Ok(Self {
             database_url: env::var("DATABASE_URL").context("DATABASE_URL must be set")?,
             redis_url: env::var("REDIS_URL").ok(),
-            jwt_secret: env::var("JWT_SECRET").context("JWT_SECRET must be set")?,
+            jwt_secret,
             falcon_base_url: env::var("FALCON_BASE_URL")
                 .unwrap_or_else(|_| "https://apextransport.ddns.net/api/go".to_string()),
             port: env::var("PORT")
@@ -47,7 +54,7 @@ impl Config {
                 .unwrap_or(false),
             falcon_database_url: env::var("FALCON_DATABASE_URL").ok(),
             anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok(),
-            ai_model: env::var("AI_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string()),
+            ai_model: env::var("AI_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string()),
         })
     }
 }

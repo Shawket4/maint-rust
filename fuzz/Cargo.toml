@@ -30,3 +30,10 @@ path = "fuzz_targets/oil_flag.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "is_safe_select"
+path = "fuzz_targets/is_safe_select.rs"
+test = false
+doc = false
+bench = false

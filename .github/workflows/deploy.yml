@@ -44,7 +44,10 @@ jobs:
 
           COPY . .
 
-          RUN cargo build --release --verbose
+          # --locked: build the exact deps in the committed Cargo.lock. Without
+          # it a semver-compatible upstream release could silently change a
+          # production deploy with no code change.
+          RUN cargo build --release --locked --verbose
 
           RUN strip target/release/maint-rust || true
 
@@ -146,6 +149,27 @@ jobs:
             echo "cd ${DEPLOY_DIR} && sqlx migrate run"
           fi
 
+          # Pre-migration Postgres snapshot. The service runs sqlx migrations on
+          # boot (main.rs), so the restart below is the moment schema changes
+          # apply. Dump NOW — the nightly cron could be up to 24h stale, and a
+          # bad migration is exactly when the freshest possible backup matters.
+          if [ -f ${DEPLOY_DIR}/.env ]; then
+            echo "Pre-deploy Postgres snapshot..."
+            PG_BACKUP_DIR=${BACKUP_DIR}/pg
+            sudo mkdir -p ${PG_BACKUP_DIR}
+            STAMP=$(date +%Y%m%d_%H%M%S)
+            # shellcheck disable=SC1091
+            DB_URL=$(sudo bash -c "source ${DEPLOY_DIR}/.env && printf %s \"\$DATABASE_URL\"")
+            if [ -n "$DB_URL" ]; then
+              sudo bash -c "pg_dump '$DB_URL' | gzip > ${PG_BACKUP_DIR}/pre_deploy_${STAMP}.sql.gz" \
+                && echo "  snapshot: ${PG_BACKUP_DIR}/pre_deploy_${STAMP}.sql.gz" \
+                || echo "  ⚠️ pre-deploy pg_dump failed — continuing (service still has old binary)"
+              sudo bash -c "ls -t ${PG_BACKUP_DIR}/pre_deploy_*.sql.gz | tail -n +15 | xargs -r rm"
+            else
+              echo "  ⚠️ DATABASE_URL not found in .env — skipping snapshot"
+            fi
+          fi
+
           echo "Restarting service..."
           sudo systemctl daemon-reload
           sudo systemctl enable ${SERVICE_NAME}
@@ -158,9 +182,25 @@ jobs:
             echo "✅ Service is running"
             sudo systemctl status ${SERVICE_NAME} --no-pager
           else
-            echo "❌ Service failed to start"
+            echo "❌ Service failed to start — rolling back to the previous binary"
             echo "Last 20 log lines:"
             sudo journalctl -u ${SERVICE_NAME} -n 20 --no-pager
+            LAST_BACKUP=$(sudo bash -c "ls -t ${BACKUP_DIR}/maint-rust.* 2>/dev/null | head -n 1")
+            if [ -n "$LAST_BACKUP" ]; then
+              echo "Restoring ${LAST_BACKUP}..."
+              sudo cp "$LAST_BACKUP" ${DEPLOY_DIR}/maint-rust
+              sudo chmod +x ${DEPLOY_DIR}/maint-rust
+              sudo systemctl restart ${SERVICE_NAME} || true
+              sleep 3
+              if sudo systemctl is-active --quiet ${SERVICE_NAME}; then
+                echo "↩️  Rolled back to the previous binary; service is running the OLD version."
+                echo "   (A schema migration may already have applied — check the pre_deploy snapshot.)"
+              else
+                echo "❌ Rollback also failed to start."
+              fi
+            else
+              echo "No previous binary to roll back to."
+            fi
             exit 1
           fi
 

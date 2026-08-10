@@ -125,6 +125,10 @@ struct TireCredit {
     model: Option<String>,
     size: Option<String>,
     qty: i32,
+    /// Idempotency key. A retried/double-clicked credit with the same ref_id is
+    /// a no-op (returns the current on-hand). Absent = a fresh, non-idempotent
+    /// credit (server mints one). The movement row records the same key.
+    ref_id: Option<String>,
 }
 
 #[post("/stock/tires/credit")]
@@ -137,6 +141,54 @@ async fn credit_tires(
         return Err(ApiError::Forbidden("stock credit requires permission >= 4".into()));
     }
     let b = body.into_inner();
+    if b.qty <= 0 {
+        return Err(ApiError::BadRequest("qty must be > 0".into()));
+    }
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?;
+
+    // Race-free idempotency: insert the movement FIRST with ON CONFLICT DO
+    // NOTHING on the unique ref_id (0018). If nothing was inserted, this ref_id
+    // already applied — return the current on-hand without bumping. Cache bump
+    // + movement in ONE transaction.
+    let mut tx = pool.begin().await?;
+    let logged: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "INSERT INTO stock_movements (kind, brand, model, size, qty, ref_id) \
+         VALUES ('tire_credit', $1, $2, $3, $4, COALESCE($5, gen_random_uuid())) \
+         ON CONFLICT (ref_id) WHERE ref_id IS NOT NULL DO NOTHING RETURNING id",
+    )
+    .bind(&b.brand)
+    .bind(&b.model)
+    .bind(&b.size)
+    .bind(b.qty)
+    .bind(ref_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if logged.is_none() {
+        // Idempotency is keyed on ref_id alone — a replay may carry a different
+        // brand/model/size than the original (a client that reused a key). Read
+        // this request's key with fetch_OPTIONAL and synthesize a zero-on-hand
+        // row when it doesn't exist, so a mismatched replay is a benign no-op,
+        // never a RowNotFound → 500.
+        let row: Option<(Value,)> = sqlx::query_as(
+            "SELECT to_jsonb(t) FROM tire_stock_cache t \
+             WHERE brand=$1 AND model=COALESCE($2,'') AND size=COALESCE($3,'')",
+        )
+        .bind(&b.brand)
+        .bind(&b.model)
+        .bind(&b.size)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let out = row.map(|r| r.0).unwrap_or_else(|| {
+            json!({
+                "brand": b.brand,
+                "model": b.model.clone().unwrap_or_default(),
+                "size": b.size.clone().unwrap_or_default(),
+                "on_hand_qty": 0,
+            })
+        });
+        return Ok(HttpResponse::Ok().json(out));
+    }
     let row: (Value,) = sqlx::query_as(
         r#"
         INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty)
@@ -151,27 +203,27 @@ async fn credit_tires(
     .bind(&b.model)
     .bind(&b.size)
     .bind(b.qty)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
-    // Log the credit as a movement so it shows in the in/out ledger (the enum
-    // always allowed tire_credit; the cache bump above just never recorded it).
-    let _ = sqlx::query(
-        "INSERT INTO stock_movements (kind, brand, model, size, qty, ref_id) \
-         VALUES ('tire_credit', $1, $2, $3, $4, gen_random_uuid())",
-    )
-    .bind(&b.brand)
-    .bind(&b.model)
-    .bind(&b.size)
-    .bind(b.qty)
-    .execute(pool.get_ref())
-    .await;
+    tx.commit().await?;
     Ok(HttpResponse::Ok().json(row.0))
+}
+
+fn parse_opt_uuid(s: Option<&str>) -> ApiResult<Option<uuid::Uuid>> {
+    match s {
+        None => Ok(None),
+        Some(s) => uuid::Uuid::parse_str(s)
+            .map(Some)
+            .map_err(|_| ApiError::BadRequest("ref_id must be a uuid".into())),
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct OilCredit {
     oil_type: String,
     liters: f64,
+    /// Idempotency key — see TireCredit::ref_id.
+    ref_id: Option<String>,
 }
 
 #[post("/stock/oil/credit")]
@@ -184,6 +236,36 @@ async fn credit_oil(
         return Err(ApiError::Forbidden("stock credit requires permission >= 4".into()));
     }
     let b = body.into_inner();
+    if b.liters <= 0.0 || b.liters.is_nan() {
+        return Err(ApiError::BadRequest("liters must be > 0".into()));
+    }
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?;
+
+    let mut tx = pool.begin().await?;
+    let logged: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "INSERT INTO stock_movements (kind, oil_type, liters, ref_id) \
+         VALUES ('oil_credit', $1, $2, COALESCE($3, gen_random_uuid())) \
+         ON CONFLICT (ref_id) WHERE ref_id IS NOT NULL DO NOTHING RETURNING id",
+    )
+    .bind(&b.oil_type)
+    .bind(b.liters)
+    .bind(ref_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if logged.is_none() {
+        // See credit_tires: idempotency is keyed on ref_id, so a replay may name
+        // a different oil_type than the original. fetch_OPTIONAL + zero fallback.
+        let row: Option<(Value,)> =
+            sqlx::query_as("SELECT to_jsonb(t) FROM oil_stock_cache t WHERE oil_type=$1")
+                .bind(&b.oil_type)
+                .fetch_optional(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        let out = row.map(|r| r.0).unwrap_or_else(|| {
+            json!({ "oil_type": b.oil_type, "liters_on_hand": 0.0 })
+        });
+        return Ok(HttpResponse::Ok().json(out));
+    }
     let row: (Value,) = sqlx::query_as(
         r#"
         INSERT INTO oil_stock_cache (oil_type, liters_on_hand)
@@ -196,16 +278,9 @@ async fn credit_oil(
     )
     .bind(&b.oil_type)
     .bind(b.liters)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
-    let _ = sqlx::query(
-        "INSERT INTO stock_movements (kind, oil_type, liters, ref_id) \
-         VALUES ('oil_credit', $1, $2, gen_random_uuid())",
-    )
-    .bind(&b.oil_type)
-    .bind(b.liters)
-    .execute(pool.get_ref())
-    .await;
+    tx.commit().await?;
     Ok(HttpResponse::Ok().json(row.0))
 }
 
@@ -242,7 +317,11 @@ async fn stock_movements(
              'id', m.id, 'kind', m.kind::text, 'brand', m.brand, 'model', m.model, 'size', m.size,
              'oil_type', m.oil_type, 'qty', m.qty, 'liters', m.liters,
              'work_order_id', m.work_order_id, 'plate', v.car_no_plate,
-             'created_at', m.created_at, 'mirrored', (m.mirrored_to_falcon_at IS NOT NULL))
+             -- Render in explicit UTC so the string is constant-offset and the
+             -- client's offline lexical ORDER BY created_at is always correct
+             -- (a Cairo-DST session tz would otherwise vary the offset).
+             'created_at', to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+             'mirrored', (m.mirrored_to_falcon_at IS NOT NULL))
            FROM stock_movements m
            LEFT JOIN work_orders wo ON wo.id = m.work_order_id
            LEFT JOIN vehicles_cache v ON v.id = wo.vehicle_id
@@ -262,7 +341,7 @@ async fn stock_movements(
 /// Dev-only: seed a batch of tire + oil stock so the garage has something to consume.
 #[post("/stock/dev-seed")]
 async fn dev_seed(state: web::Data<AppState>, pool: web::Data<PgPool>) -> ApiResult<HttpResponse> {
-    if !state.dev_login {
+    if !cfg!(debug_assertions) || !state.dev_login {
         return Err(ApiError::Forbidden("dev-seed disabled".into()));
     }
     sqlx::query(

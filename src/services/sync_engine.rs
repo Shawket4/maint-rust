@@ -609,3 +609,24 @@ pub async fn pull_rows(
         has_more,
     })
 }
+
+#[cfg(test)]
+mod nul_tests {
+    use super::json_has_nul;
+    use serde_json::json;
+
+    #[test]
+    fn detects_nul_everywhere_and_nowhere() {
+        // clean
+        assert!(!json_has_nul(&json!({"title": "hello", "n": 5, "ok": true, "x": null})));
+        assert!(!json_has_nul(&json!([1, "a", {"b": "c"}])));
+        // string value
+        assert!(json_has_nul(&json!({"title": "a\u{0000}b"})));
+        // array element
+        assert!(json_has_nul(&json!(["ok", "bad\u{0000}"])));
+        // nested object value
+        assert!(json_has_nul(&json!({"a": {"b": "x\u{0000}y"}})));
+        // OBJECT KEY — the easily-missed branch
+        assert!(json_has_nul(&json!({"k\u{0000}": 1})));
+    }
+}
