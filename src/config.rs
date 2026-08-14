@@ -37,7 +37,7 @@ impl Config {
             falcon_base_url: env::var("FALCON_BASE_URL")
                 .unwrap_or_else(|_| "https://apextransport.ddns.net/api/go".to_string()),
             port: env::var("PORT")
-                .unwrap_or_else(|_| "8090".to_string())
+                .unwrap_or_else(|_| "8095".to_string())
                 .parse()
                 .context("PORT must be a u16")?,
             bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string()),

@@ -107,12 +107,12 @@ jobs:
 
           # Free the port the service binds. systemctl only stops the process
           # IT owns — an orphaned maint-rust started outside systemd (e.g. a
-          # manual `nohup`/`screen` run) keeps holding :8090, so every deploy
+          # manual `nohup`/`screen` run) keeps holding the port, so every deploy
           # dies with "Address already in use (os error 98)" and the box keeps
           # serving stale code forever. Kill whatever still holds the port.
-          PORT_PID=$(sudo ss -lptnH "sport = :8090" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)
+          PORT_PID=$(sudo ss -lptnH "sport = :8095" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)
           if [ -n "$PORT_PID" ]; then
-            echo "Port 8090 still held by PID $PORT_PID after stop — freeing it..."
+            echo "Port 8095 still held by PID $PORT_PID after stop — freeing it..."
             sudo kill "$PORT_PID" 2>/dev/null || true
             sleep 2
             sudo kill -9 "$PORT_PID" 2>/dev/null || true
@@ -254,7 +254,7 @@ jobs:
 
           # Service is HTTP-only on loopback — no TLS, no -k flag needed
           ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "curl -f http://127.0.0.1:8090/api/maint/health || echo 'Health check endpoint not available'"
+            "curl -f http://127.0.0.1:8095/api/maint/health || echo 'Health check endpoint not available'"
 
       - name: Verify deployment
         run: |
