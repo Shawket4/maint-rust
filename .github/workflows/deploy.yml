@@ -105,6 +105,20 @@ jobs:
           echo "Stopping service..."
           sudo systemctl stop ${SERVICE_NAME} || true
 
+          # Free the port the service binds. systemctl only stops the process
+          # IT owns — an orphaned maint-rust started outside systemd (e.g. a
+          # manual `nohup`/`screen` run) keeps holding :8090, so every deploy
+          # dies with "Address already in use (os error 98)" and the box keeps
+          # serving stale code forever. Kill whatever still holds the port.
+          PORT_PID=$(sudo ss -lptnH "sport = :8090" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)
+          if [ -n "$PORT_PID" ]; then
+            echo "Port 8090 still held by PID $PORT_PID after stop — freeing it..."
+            sudo kill "$PORT_PID" 2>/dev/null || true
+            sleep 2
+            sudo kill -9 "$PORT_PID" 2>/dev/null || true
+            sleep 1
+          fi
+
           if [ -f ${DEPLOY_DIR}/maint-rust ]; then
             echo "Backing up existing binary..."
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -185,6 +199,15 @@ jobs:
             echo "❌ Service failed to start — rolling back to the previous binary"
             echo "Last 20 log lines:"
             sudo journalctl -u ${SERVICE_NAME} -n 20 --no-pager
+            # Preserve the just-deployed (new) binary before we overwrite it —
+            # binary rollback is only safe if the schema DIDN'T move forward.
+            # Once migrations have applied, an older binary fails to start
+            # ("migration N was previously applied but has been modified" /
+            # missing migration), so a naive rollback strands the box on an
+            # un-startable OLD binary. Try the rollback, but if it also fails,
+            # put the NEW binary back so the box is left in a forward-fixable
+            # state (schema-current binary on disk) rather than a dead one.
+            sudo cp ${DEPLOY_DIR}/maint-rust ${DEPLOY_DIR}/maint-rust.new-failed || true
             LAST_BACKUP=$(sudo bash -c "ls -t ${BACKUP_DIR}/maint-rust.* 2>/dev/null | head -n 1")
             if [ -n "$LAST_BACKUP" ]; then
               echo "Restoring ${LAST_BACKUP}..."
@@ -196,7 +219,15 @@ jobs:
                 echo "↩️  Rolled back to the previous binary; service is running the OLD version."
                 echo "   (A schema migration may already have applied — check the pre_deploy snapshot.)"
               else
-                echo "❌ Rollback also failed to start."
+                echo "❌ Rollback also failed to start (likely schema moved forward)."
+                echo "   Restoring the new (schema-current) binary so the box is forward-fixable."
+                sudo cp ${DEPLOY_DIR}/maint-rust.new-failed ${DEPLOY_DIR}/maint-rust || true
+                sudo chmod +x ${DEPLOY_DIR}/maint-rust
+                sudo systemctl restart ${SERVICE_NAME} || true
+                sleep 3
+                sudo systemctl is-active --quiet ${SERVICE_NAME} \
+                  && echo "✅ New binary is now running after all." \
+                  || echo "❌ Still down — needs a human. pre_deploy snapshot is safe."
               fi
             else
               echo "No previous binary to roll back to."
