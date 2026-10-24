@@ -132,7 +132,12 @@ pub async fn upsert_cars_into_cache(
         // corrections work via superseded_km) — merging them here was an
         // upward-only second arbitration rule that contradicted it and
         // contaminated raw_payload.
-        let mileage = v.get("mileage").and_then(|x| x.as_i64()).map(|x| x as i32);
+        // Falcon stores mileage as float64 (oil-change readings can carry a
+        // fraction); as_i64 alone turned 123456.5 into NULL.
+        let mileage = v
+            .get("mileage")
+            .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f.round() as i64)))
+            .map(|x| x as i32);
         let driver_id = v.get("driver_id").and_then(|x| x.as_i64()).map(|x| x as i32);
         let operating_company = v
             .get("operating_company")

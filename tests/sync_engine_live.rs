@@ -1049,6 +1049,65 @@ async fn override_corrects_downward_and_later_readings_resume_in_the_view() {
     );
 }
 
+/// Server twin of the client's `falcon_mileage_counts_as_a_reading` (0019):
+/// an oil change recorded in Falcon raises `cars.mileage` past the last fuel
+/// reading, and that must move the odometer here too.
+#[tokio::test]
+async fn falcon_mileage_counts_as_a_reading_in_the_view() {
+    let Some(pool) = test_pool().await else { return };
+    let vid = fresh_vehicle_id();
+    sqlx::query(
+        "INSERT INTO vehicles_cache (id, car_no_plate, last_fuel_odometer, mileage, raw_payload, fetched_at)
+         VALUES ($1, 'PARITY-3', 200000, 204500, '{}'::jsonb, now())",
+    )
+    .bind(vid as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    async fn odo(pool: &PgPool, vid: i64) -> (i32, String) {
+        sqlx::query_as(
+            "SELECT current_odometer, odometer_source FROM v_current_odometer WHERE vehicle_id = $1",
+        )
+        .bind(vid as i32)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+    assert_eq!(odo(&pool, vid).await, (204_500, "falcon_mileage".into()));
+
+    // An equal fuel reading names the source more precisely.
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 204500 WHERE id = $1")
+        .bind(vid as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(odo(&pool, vid).await, (204_500, "falcon_fuel".into()));
+
+    // A downward correction that superseded the mileage pins it too.
+    sqlx::query(
+        "INSERT INTO vehicle_odometer_overrides
+           (vehicle_id, odometer, set_at, superseded_km, created_by_user_id, updated_by_user_id)
+         VALUES ($1, 150000, now(), 204500, 1, 1)",
+    )
+    .bind(vid as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(odo(&pool, vid).await, (150_000, "manual_override".into()));
+
+    sqlx::query("UPDATE vehicles_cache SET mileage = 205000 WHERE id = $1")
+        .bind(vid as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        odo(&pool, vid).await,
+        (205_000, "falcon_mileage".into()),
+        "mileage past superseded_km re-engages"
+    );
+}
+
 /// Server twin of the client's `mounted_tire_km_is_live_with_the_odometer`:
 /// v_tires_list's derived lifetime km = base + closed road deltas + live run.
 #[tokio::test]
