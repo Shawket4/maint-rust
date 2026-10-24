@@ -71,6 +71,8 @@ jobs:
 
           cp maint-rust deployment/
           cp -r migrations deployment/ || true
+          mkdir -p deployment/scripts
+          cp scripts/reset_legacy_schema.sql deployment/scripts/
           cp .env.example deployment/.env.example || true
 
           tar -czf deployment.tar.gz -C deployment .
@@ -184,6 +186,37 @@ jobs:
             fi
           fi
 
+          # One-time: the 2026-07-20 rebuild rewrote migrations 0003+ in place,
+          # so a DB still on the old (May) schema can never boot this binary.
+          # The owner chose to discard that data. Keep a dump that the
+          # pre_deploy rotation never deletes, then drop the old objects and
+          # let the migrations build the new schema on boot. The SQL guards
+          # itself too, so this is a no-op once the box is on the new schema.
+          if [ -n "${DB_URL:-}" ]; then
+            LEGACY=$(sudo bash -c "psql '$DB_URL' -tAc \"SELECT 1 FROM _sqlx_migrations WHERE version = 3 AND description = 'maintenance tables'\"" 2>/dev/null || true)
+            if [ "$LEGACY" = "1" ]; then
+              echo "Legacy (pre-rebuild) schema found — backing it up and resetting..."
+              LEGACY_DUMP=${BACKUP_DIR}/pg/legacy_schema_before_rebuild_$(date +%Y%m%d_%H%M%S).sql.gz
+              sudo bash -c "set -o pipefail; pg_dump '$DB_URL' | gzip > ${LEGACY_DUMP}"
+              echo "  legacy backup: ${LEGACY_DUMP}"
+              sudo bash -c "psql '$DB_URL' -v ON_ERROR_STOP=1 --single-transaction -f ${DEPLOY_DIR}/scripts/reset_legacy_schema.sql"
+            fi
+          fi
+
+          # nginx used to proxy /api/maint/ to :8090; the service now binds
+          # :8095 (an orphan held 8090). Repoint any such proxy_pass.
+          NGINX_FILES=$(sudo grep -rlE 'proxy_pass\s+http://127\.0\.0\.1:8090/api/maint' /etc/nginx/ 2>/dev/null || true)
+          if [ -n "$NGINX_FILES" ]; then
+            for f in $NGINX_FILES; do
+              echo "Repointing /api/maint/ proxy to :8095 in $f"
+              sudo cp "$f" "${f}.bak.$(date +%Y%m%d_%H%M%S)"
+              sudo sed -i -E 's#(proxy_pass\s+http://127\.0\.0\.1:)8090(/api/maint)#\18095\2#' "$f"
+            done
+            sudo nginx -t && sudo systemctl reload nginx
+          fi
+          echo "nginx routes for /api/maint/:"
+          sudo grep -rn -A2 'location /api/maint' /etc/nginx/ 2>/dev/null || echo "  ⚠️ no 'location /api/maint' block found in /etc/nginx"
+
           echo "Restarting service..."
           sudo systemctl daemon-reload
           sudo systemctl enable ${SERVICE_NAME}
@@ -254,7 +287,11 @@ jobs:
 
           # Service is HTTP-only on loopback — no TLS, no -k flag needed
           ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "curl -f http://127.0.0.1:8095/api/maint/health || echo 'Health check endpoint not available'"
+            "curl -fsS http://127.0.0.1:8095/api/maint/health"
+
+          # And through nginx, the way the app reaches it. A 404 here is what
+          # left the app logged in with no data for months.
+          curl -fsS https://apextransport.ddns.net/api/maint/health
 
       - name: Verify deployment
         run: |
