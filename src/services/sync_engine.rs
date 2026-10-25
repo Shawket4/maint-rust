@@ -230,7 +230,7 @@ pub async fn apply_push_operation(
 
     // Read the current row (if any) inside the same transaction so concurrent
     // writers don't race us.
-    let row_now = fetch_row_json(tx, table, pk, &op.entity_id).await?;
+    let row_now = fetch_row_json(&mut **tx, table, pk, &op.entity_id).await?;
 
     let no_refs: Vec<Uuid> = Vec::new();
 
@@ -370,7 +370,7 @@ pub async fn apply_push_operation(
                 // committed between our read and this statement. Re-read and
                 // report the conflict instead of silently overwriting.
                 Ok(None) => {
-                    let fresh = fetch_row_json(tx, table, pk, &op.entity_id).await?;
+                    let fresh = fetch_row_json(&mut **tx, table, pk, &op.entity_id).await?;
                     Ok((
                         match fresh {
                             Some(server_row) => PushResultStatus::Conflict {
@@ -465,7 +465,7 @@ pub async fn apply_push_operation(
                     ))
                 }
                 None => {
-                    let fresh = fetch_row_json(tx, table, pk, &op.entity_id).await?;
+                    let fresh = fetch_row_json(&mut **tx, table, pk, &op.entity_id).await?;
                     Ok((
                         match fresh {
                             Some(server_row) => PushResultStatus::Conflict {
@@ -485,8 +485,8 @@ pub async fn apply_push_operation(
     }
 }
 
-async fn fetch_row_json(
-    tx: &mut Transaction<'_, Postgres>,
+async fn fetch_row_json<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
     table: &str,
     pk: &str,
     pk_value: &str,
@@ -496,8 +496,19 @@ async fn fetch_row_json(
     let q = format!(
         "SELECT to_jsonb(t) AS row FROM {table} t WHERE {pk}::text = $1 LIMIT 1"
     );
-    let opt: Option<(Value,)> = sqlx::query_as(&q).bind(pk_value).fetch_optional(&mut **tx).await?;
+    let opt: Option<(Value,)> = sqlx::query_as(&q).bind(pk_value).fetch_optional(exec).await?;
     Ok(opt.map(|t| t.0))
+}
+
+/// The server's current row for one synced entity, exactly as a push conflict
+/// would report it (soft-deleted rows included — `deleted_at` says so). Used
+/// by GET /records/{entity_type}/{entity_id}.
+pub async fn fetch_record(
+    pool: &PgPool,
+    entity: EntityType,
+    entity_id: &str,
+) -> ApiResult<Option<Value>> {
+    fetch_row_json(pool, entity.table_name(), entity.pk_column(), entity_id).await
 }
 
 /// Generic INSERT for an entity from a JSON payload.

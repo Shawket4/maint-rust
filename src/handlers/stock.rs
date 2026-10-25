@@ -97,6 +97,19 @@ async fn debit_stock(
             return Err(ApiError::BadRequest(format!("unknown debit kind: {other}")));
         }
     };
+    // A zero/negative amount would credit stock through the debit path (and an
+    // omitted one recorded an empty movement). Nothing in the desktop app calls
+    // this route — its debits are derived server-side from synced oil changes
+    // and mounts — so every amount here is a deliberate, positive one.
+    match kind {
+        "tire_debit" if d.qty.map_or(true, |q| q <= 0) => {
+            return Err(ApiError::BadRequest("tire_debit needs qty > 0".into()));
+        }
+        "oil_debit" if d.liters.map_or(true, |l| !l.is_finite() || l <= 0.0) => {
+            return Err(ApiError::BadRequest("oil_debit needs liters > 0".into()));
+        }
+        _ => {}
+    }
     let spec = stock_ledger::DebitSpec {
         kind,
         brand: d.brand,

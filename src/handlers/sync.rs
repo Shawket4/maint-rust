@@ -1,13 +1,16 @@
 use actix_web::{get, post, web, HttpResponse};
 use chrono::{TimeZone, Utc};
+use serde_json::{json, Value};
 
 use crate::auth::middleware::BearerToken;
 use crate::auth::AuthClaims;
 use crate::db::PgPool;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::handlers::AppState;
 use crate::services::stock_ledger;
-use crate::services::sync_engine::{apply_push_batch, pull_rows, PullQuery, PullResponse, PushBody};
+use crate::services::sync_engine::{
+    apply_push_batch, fetch_record, pull_rows, EntityType, PullQuery, PullResponse, PushBody,
+};
 
 #[post("/sync/push")]
 async fn sync_push(
@@ -43,6 +46,30 @@ async fn sync_pull(
     Ok(HttpResponse::Ok().json(resp))
 }
 
+/// One synced row by entity type + PK, with the sync_version a follow-up
+/// update/delete must send. The advisor uses it for the before-state of a
+/// proposed change. Same table/PK map as push/pull; soft-deleted rows are
+/// returned as-is (their `deleted_at` is set).
+#[get("/records/{entity_type}/{entity_id}")]
+async fn get_record(
+    pool: web::Data<PgPool>,
+    path: web::Path<(String, String)>,
+) -> ApiResult<HttpResponse> {
+    let (entity_type, entity_id) = path.into_inner();
+    let entity: EntityType = serde_json::from_value(Value::String(entity_type.clone()))
+        .map_err(|_| ApiError::BadRequest(format!("unknown entity_type: {entity_type}")))?;
+    let row = fetch_record(pool.get_ref(), entity, &entity_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("{entity_type} {entity_id}")))?;
+    let sync_version = row.get("sync_version").and_then(Value::as_i64);
+    Ok(HttpResponse::Ok().json(json!({
+        "entity_type": entity,
+        "entity_id": entity_id,
+        "row": row,
+        "sync_version": sync_version,
+    })))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(sync_push).service(sync_pull);
+    cfg.service(sync_push).service(sync_pull).service(get_record);
 }
