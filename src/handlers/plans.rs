@@ -83,9 +83,11 @@ async fn upsert_plan(
             trigger_type = EXCLUDED.trigger_type,
             interval_km = EXCLUDED.interval_km,
             interval_days = EXCLUDED.interval_days,
-            lead_warn_km = EXCLUDED.lead_warn_km,
-            lead_warn_days = EXCLUDED.lead_warn_days,
-            is_active = EXCLUDED.is_active,
+            -- Omitted on an update = keep the stored value. EXCLUDED already
+            -- carries the insert defaults (500/14/TRUE), so read the raw params.
+            lead_warn_km = COALESCE($6, service_plans.lead_warn_km),
+            lead_warn_days = COALESCE($7, service_plans.lead_warn_days),
+            is_active = COALESCE($8, service_plans.is_active),
             updated_at = now(),
             updated_by_user_id = EXCLUDED.updated_by_user_id,
             sync_version = service_plans.sync_version + 1

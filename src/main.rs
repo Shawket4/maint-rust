@@ -4,9 +4,8 @@ use anyhow::Context;
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use maint_rust::{auth, config, db, falcon, handlers};
+use maint_rust::{config, db, falcon, handlers};
 
-use auth::JwtAuth;
 use config::Config;
 use falcon::{CacheManager, FalconClient};
 use handlers::AppState;
@@ -73,7 +72,6 @@ async fn main() -> anyhow::Result<()> {
     let jwt_secret = cfg.jwt_secret.clone();
 
     HttpServer::new(move || {
-        let auth_mw = JwtAuth::new(jwt_secret.clone());
         App::new()
             .app_data(web::Data::new(app_state.clone()))
             .app_data(web::Data::new(pool.clone()))
@@ -81,26 +79,7 @@ async fn main() -> anyhow::Result<()> {
             .wrap(Logger::default())
             .wrap(TracingLogger::default())
             .wrap(Cors::permissive())
-            .service(
-                web::scope("/api/maint")
-                    .configure(handlers::health::configure)
-                    .configure(handlers::auth_login::configure)
-                    .service(
-                        web::scope("")
-                            .wrap(auth_mw)
-                            .configure(handlers::cache_vehicles::configure)
-                            .configure(handlers::cache_invoices::configure)
-                            .configure(handlers::reference::configure)
-                            .configure(handlers::due::configure)
-                            .configure(handlers::plans::configure)
-                            .configure(handlers::stock::configure)
-                            .configure(handlers::work_orders::configure)
-                            .configure(handlers::tires::configure)
-                            .configure(handlers::service::configure)
-                            .configure(handlers::ai::configure)
-                            .configure(handlers::sync::configure),
-                    ),
-            )
+            .service(handlers::api_scope(jwt_secret.clone()))
     })
     .bind(bind)?
     .run()
