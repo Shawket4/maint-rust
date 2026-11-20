@@ -31,10 +31,12 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init_pool(&cfg.database_url).await?;
 
     // Run migrations on startup. This makes the deploy story painless on a fresh box.
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("running migrations")?;
+    // ignore_missing: a database that is AHEAD of this binary (a newer build
+    // migrated it, then was rolled back) must still boot. Without it the
+    // previous binary refuses to start and a failed deploy cannot roll back.
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(&pool).await.context("running migrations")?;
     tracing::info!("migrations up to date");
 
     // Optional read-only pool to Falcon's Postgres (service history + AI SQL tool).
@@ -66,7 +68,15 @@ async fn main() -> anyhow::Result<()> {
         falcon_pool,
         anthropic_api_key: cfg.anthropic_api_key.clone(),
         ai_model: cfg.ai_model.clone(),
+        permissions: Default::default(),
+        mirror_busy: Default::default(),
+        http: handlers::ai::http_client(),
+        ai_limiter: Default::default(),
     };
+
+    // Old Falcon service invoices → maintenance history (no-op without the
+    // read-only Falcon database).
+    maint_rust::services::legacy_import::spawn_periodic(app_state.pool.clone(), app_state.falcon_pool.clone());
 
     let bind = (cfg.bind_addr.clone(), cfg.port);
     let jwt_secret = cfg.jwt_secret.clone();

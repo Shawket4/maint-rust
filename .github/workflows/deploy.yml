@@ -1,23 +1,57 @@
-name: Build and Deploy Rust App
+name: Test, Build and Deploy
 
 on:
   push:
     branches: [main, master]
+  pull_request:
   workflow_dispatch:
 
+# One deploy at a time: two overlapping runs used to stop/extract/restart the
+# service on top of each other.
+concurrency:
+  group: maint-rust-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: maint
+          POSTGRES_PASSWORD: maint
+          POSTGRES_DB: maint_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maint" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # The live suites need a database. Without MAINT_TEST_DATABASE_URL they
+      # return early and pass — which is how every sync test "passed" in CI
+      # for months without running. MAINT_REQUIRE_LIVE_TESTS makes a missing
+      # database a failure here.
+      - name: Test (unit + live Postgres suites)
+        env:
+          MAINT_TEST_DATABASE_URL: postgres://maint:maint@127.0.0.1:5432/maint_test
+          MAINT_REQUIRE_LIVE_TESTS: "1"
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --locked
+
   build-and-deploy:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Test (unit + vocabulary pins; live tests skip without a DB)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --locked
 
       - name: Build in Docker (Ubuntu 22.04 - matches VPS)
         env:
@@ -37,7 +71,7 @@ jobs:
               ca-certificates \
               && rm -rf /var/lib/apt/lists/*
 
-          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           ENV PATH="/root/.cargo/bin:${PATH}"
 
           WORKDIR /app
@@ -75,8 +109,6 @@ jobs:
 
           cp maint-rust deployment/
           cp -r migrations deployment/ || true
-          mkdir -p deployment/scripts
-          cp scripts/reset_legacy_schema.sql deployment/scripts/
           cp .env.example deployment/.env.example || true
 
           tar -czf deployment.tar.gz -C deployment .
@@ -108,14 +140,81 @@ jobs:
           sudo mkdir -p ${BACKUP_DIR}
           sudo mkdir -p ${DEPLOY_DIR}/logs
 
+          # ── 1. Everything that can fail happens while the OLD service is
+          #       still serving: stage the files, take the database snapshot.
+          STAGE=$(sudo mktemp -d ${DEPLOY_DIR}/.stage.XXXXXX)
+          sudo tar -xzf /tmp/deployment.tar.gz -C "${STAGE}"
+          sudo chmod +x "${STAGE}/maint-rust"
+
+          # Nightly Postgres backup — this DB is the sole home of all
+          # maintenance truth. pipefail: a failed pg_dump used to leave an
+          # empty .gz and report success.
+          sudo tee /etc/cron.daily/maint-pg-backup > /dev/null << 'CRON'
+          #!/bin/bash
+          set -euo pipefail
+          umask 077
+          BACKUP_DIR=/opt/maint-rust/backups/pg
+          mkdir -p "$BACKUP_DIR"
+          STAMP=$(date +%Y%m%d)
+          # DATABASE_URL from the service env file
+          source /opt/maint-rust/.env
+          TMP="$BACKUP_DIR/.apex_maint_$STAMP.sql.gz.tmp"
+          pg_dump "$DATABASE_URL" | gzip > "$TMP"
+          gzip -t "$TMP"
+          mv "$TMP" "$BACKUP_DIR/apex_maint_$STAMP.sql.gz"
+          # keep 14 days
+          ls -t "$BACKUP_DIR"/apex_maint_*.sql.gz | tail -n +15 | xargs -r rm
+          CRON
+          sudo chmod +x /etc/cron.daily/maint-pg-backup
+
+          # Pre-migration snapshot. The service migrates on boot, so the
+          # restart below is when the schema changes. No snapshot, no deploy.
+          if [ -f ${DEPLOY_DIR}/.env ]; then
+            echo "Pre-deploy Postgres snapshot..."
+            PG_BACKUP_DIR=${BACKUP_DIR}/pg
+            sudo mkdir -p ${PG_BACKUP_DIR}
+            STAMP=$(date +%Y%m%d_%H%M%S)
+            SNAP=${PG_BACKUP_DIR}/pre_deploy_${STAMP}.sql.gz
+            sudo tee /tmp/maint-snapshot.sh > /dev/null << 'SNAPSH'
+          #!/bin/bash
+          set -euo pipefail
+          umask 077
+          source /opt/maint-rust/.env
+          [ -n "${DATABASE_URL:-}" ]
+          pg_dump "$DATABASE_URL" | gzip > "$1"
+          gzip -t "$1"
+          [ -s "$1" ]
+          SNAPSH
+            if sudo bash /tmp/maint-snapshot.sh "${SNAP}"; then
+              echo "  snapshot: ${SNAP}"
+            else
+              echo "❌ pre-deploy snapshot failed — NOT deploying (the old service is untouched)"
+              sudo rm -f "${SNAP}" /tmp/maint-snapshot.sh
+              sudo rm -rf "${STAGE}"
+              exit 1
+            fi
+            sudo rm -f /tmp/maint-snapshot.sh
+            sudo bash -c "ls -t ${PG_BACKUP_DIR}/pre_deploy_*.sql.gz | tail -n +15 | xargs -r rm"
+          else
+            echo "  no ${DEPLOY_DIR}/.env yet (first install) — no snapshot to take"
+          fi
+
+          if [ -f ${DEPLOY_DIR}/maint-rust ]; then
+            echo "Backing up existing binary..."
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            sudo cp ${DEPLOY_DIR}/maint-rust ${BACKUP_DIR}/maint-rust.${TIMESTAMP}
+            sudo bash -c "ls -t ${BACKUP_DIR}/maint-rust.2* | tail -n +6 | xargs -r rm"
+          fi
+
+          # ── 2. Short window: stop, swap, start. If anything in here fails,
+          #       start whatever binary is in place rather than leave the box down.
+          trap 'echo "deploy step failed — starting the service again"; sudo systemctl start ${SERVICE_NAME} || true' ERR
+
           echo "Stopping service..."
           sudo systemctl stop ${SERVICE_NAME} || true
 
-          # Free the port the service binds. systemctl only stops the process
-          # IT owns — an orphaned maint-rust started outside systemd (e.g. a
-          # manual `nohup`/`screen` run) keeps holding the port, so every deploy
-          # dies with "Address already in use (os error 98)" and the box keeps
-          # serving stale code forever. Kill whatever still holds the port.
+          # systemctl only stops the process IT owns — an orphaned maint-rust
+          # started outside systemd keeps holding the port.
           PORT_PID=$(sudo ss -lptnH "sport = :8095" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)
           if [ -n "$PORT_PID" ]; then
             echo "Port 8095 still held by PID $PORT_PID after stop — freeing it..."
@@ -125,86 +224,19 @@ jobs:
             sleep 1
           fi
 
-          if [ -f ${DEPLOY_DIR}/maint-rust ]; then
-            echo "Backing up existing binary..."
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            sudo cp ${DEPLOY_DIR}/maint-rust ${BACKUP_DIR}/maint-rust.${TIMESTAMP}
-            sudo ls -t ${BACKUP_DIR}/maint-rust.* | tail -n +6 | xargs -r sudo rm
-          fi
-
-          echo "Extracting new files..."
-          cd ${DEPLOY_DIR}
-          sudo tar -xzf /tmp/deployment.tar.gz
-
-          echo "Files in deployment directory:"
-          ls -la ${DEPLOY_DIR}/
-
+          echo "Installing new files..."
+          sudo cp "${STAGE}/maint-rust" ${DEPLOY_DIR}/maint-rust
+          sudo rm -rf ${DEPLOY_DIR}/migrations
+          if [ -d "${STAGE}/migrations" ]; then sudo cp -r "${STAGE}/migrations" ${DEPLOY_DIR}/migrations; fi
+          if [ -f "${STAGE}/.env.example" ]; then sudo cp "${STAGE}/.env.example" ${DEPLOY_DIR}/.env.example; fi
+          sudo rm -rf "${STAGE}"
           sudo chmod +x ${DEPLOY_DIR}/maint-rust
-          sudo chown -R root:root ${DEPLOY_DIR}
-
-          # Nightly Postgres backup — this DB is the sole home of all
-          # maintenance truth; the binary backup above never covered it.
-          sudo tee /etc/cron.daily/maint-pg-backup > /dev/null << 'CRON'
-          #!/bin/bash
-          set -e
-          BACKUP_DIR=/opt/maint-rust/backups/pg
-          mkdir -p "$BACKUP_DIR"
-          STAMP=$(date +%Y%m%d)
-          # DATABASE_URL from the service env file
-          source /opt/maint-rust/.env
-          pg_dump "$DATABASE_URL" | gzip > "$BACKUP_DIR/apex_maint_$STAMP.sql.gz"
-          # keep 14 days
-          ls -t "$BACKUP_DIR"/apex_maint_*.sql.gz | tail -n +15 | xargs -r rm
-          CRON
-          sudo chmod +x /etc/cron.daily/maint-pg-backup
 
           if [ ! -f ${DEPLOY_DIR}/.env ] && [ -f ${DEPLOY_DIR}/.env.example ]; then
             echo "Creating .env from .env.example..."
             sudo cp ${DEPLOY_DIR}/.env.example ${DEPLOY_DIR}/.env
+            sudo chmod 600 ${DEPLOY_DIR}/.env
             echo "⚠️  Please configure ${DEPLOY_DIR}/.env with your settings"
-          fi
-
-          if [ -d ${DEPLOY_DIR}/migrations ]; then
-            echo "Migrations directory found. Run manually if needed:"
-            echo "cd ${DEPLOY_DIR} && sqlx migrate run"
-          fi
-
-          # Pre-migration Postgres snapshot. The service runs sqlx migrations on
-          # boot (main.rs), so the restart below is the moment schema changes
-          # apply. Dump NOW — the nightly cron could be up to 24h stale, and a
-          # bad migration is exactly when the freshest possible backup matters.
-          if [ -f ${DEPLOY_DIR}/.env ]; then
-            echo "Pre-deploy Postgres snapshot..."
-            PG_BACKUP_DIR=${BACKUP_DIR}/pg
-            sudo mkdir -p ${PG_BACKUP_DIR}
-            STAMP=$(date +%Y%m%d_%H%M%S)
-            # shellcheck disable=SC1091
-            DB_URL=$(sudo bash -c "source ${DEPLOY_DIR}/.env && printf %s \"\$DATABASE_URL\"")
-            if [ -n "$DB_URL" ]; then
-              sudo bash -c "pg_dump '$DB_URL' | gzip > ${PG_BACKUP_DIR}/pre_deploy_${STAMP}.sql.gz" \
-                && echo "  snapshot: ${PG_BACKUP_DIR}/pre_deploy_${STAMP}.sql.gz" \
-                || echo "  ⚠️ pre-deploy pg_dump failed — continuing (service still has old binary)"
-              sudo bash -c "ls -t ${PG_BACKUP_DIR}/pre_deploy_*.sql.gz | tail -n +15 | xargs -r rm"
-            else
-              echo "  ⚠️ DATABASE_URL not found in .env — skipping snapshot"
-            fi
-          fi
-
-          # One-time: the 2026-07-20 rebuild rewrote migrations 0003+ in place,
-          # so a DB still on the old (May) schema can never boot this binary.
-          # The owner chose to discard that data. Keep a dump that the
-          # pre_deploy rotation never deletes, then drop the old objects and
-          # let the migrations build the new schema on boot. The SQL guards
-          # itself too, so this is a no-op once the box is on the new schema.
-          if [ -n "${DB_URL:-}" ]; then
-            LEGACY=$(sudo bash -c "psql '$DB_URL' -tAc \"SELECT 1 FROM _sqlx_migrations WHERE version = 3 AND description = 'maintenance tables'\"" 2>/dev/null || true)
-            if [ "$LEGACY" = "1" ]; then
-              echo "Legacy (pre-rebuild) schema found — backing it up and resetting..."
-              LEGACY_DUMP=${BACKUP_DIR}/pg/legacy_schema_before_rebuild_$(date +%Y%m%d_%H%M%S).sql.gz
-              sudo bash -c "set -o pipefail; pg_dump '$DB_URL' | gzip > ${LEGACY_DUMP}"
-              echo "  legacy backup: ${LEGACY_DUMP}"
-              sudo bash -c "psql '$DB_URL' -v ON_ERROR_STOP=1 --single-transaction -f ${DEPLOY_DIR}/scripts/reset_legacy_schema.sql"
-            fi
           fi
 
           # nginx used to proxy /api/maint/ to :8090; the service now binds
@@ -221,6 +253,7 @@ jobs:
           echo "nginx routes for /api/maint/:"
           sudo grep -rn -A2 'location /api/maint' /etc/nginx/ 2>/dev/null || echo "  ⚠️ no 'location /api/maint' block found in /etc/nginx"
 
+          trap - ERR
           echo "Restarting service..."
           sudo systemctl daemon-reload
           sudo systemctl enable ${SERVICE_NAME}
@@ -282,7 +315,7 @@ jobs:
 
           echo "Deploying on VPS..."
           scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} deploy.sh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "bash /tmp/deploy.sh"
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "bash /tmp/deploy.sh"
 
       - name: Health check
         run: |
@@ -290,7 +323,7 @@ jobs:
           sleep 5
 
           # Service is HTTP-only on loopback — no TLS, no -k flag needed
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
             "curl -fsS http://127.0.0.1:8095/api/maint/health"
 
           # And through nginx, the way the app reaches it. A 404 here is what
@@ -300,14 +333,14 @@ jobs:
       - name: Verify deployment
         run: |
           echo "Verifying service status..."
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
             "systemctl status maint-rust --no-pager" || true
 
       - name: Show recent logs
         if: always()
         run: |
           echo "Recent service logs:"
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
             "sudo journalctl -u maint-rust -n 30 --no-pager" || true
 
       - name: Cleanup

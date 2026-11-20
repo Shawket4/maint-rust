@@ -3,8 +3,10 @@ pub mod ai_audit;
 pub mod auth_login;
 pub mod cache_invoices;
 pub mod cache_vehicles;
+pub mod catalog;
 pub mod due;
 pub mod health;
+pub mod office;
 pub mod plans;
 pub mod reference;
 pub mod service;
@@ -35,6 +37,14 @@ pub struct AppState {
     pub falcon_pool: Option<PgPool>,
     pub anthropic_api_key: Option<String>,
     pub ai_model: String,
+    /// Live Falcon permission lookups (cached), see auth::live.
+    pub permissions: crate::auth::live::PermissionCache,
+    /// True while a background stock-mirror sweep is running.
+    pub mirror_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared HTTP client for the AI endpoint (timeouts set once).
+    pub http: reqwest::Client,
+    /// Per-user AI request budget.
+    pub ai_limiter: crate::handlers::ai::RateLimiter,
 }
 
 /// Everything under /api/maint. Shared by main.rs and the HTTP tests so both
@@ -54,6 +64,8 @@ pub fn api_scope(jwt_secret: String) -> impl HttpServiceFactory {
                 .configure(cache_vehicles::configure)
                 .configure(cache_invoices::configure)
                 .configure(reference::configure)
+                .configure(catalog::configure)
+                .configure(office::configure)
                 .configure(due::configure)
                 .configure(plans::configure)
                 .configure(stock::configure)

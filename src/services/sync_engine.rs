@@ -1,20 +1,34 @@
-//! Sync engine — implements §7 push/pull.
+//! Sync engine: push (client → server) and pull (server → client).
 //!
-//! Push: client sends operations with their current sync_version; server applies
-//! them within a transaction. On a stale sync_version, the operation reports
-//! "conflict" and the server's current row is returned.
+//! PUSH
+//! * Every op may carry an `op_id` (the client's outbox UUID). An applied op is
+//!   remembered in `sync_applied_ops`; a redelivery returns the stored result.
+//!   This is the only sound idempotency: a response the client never heard is
+//!   neither re-applied nor turned into a conflict.
+//! * Consecutive ops sharing a `group_id` are one business action (mint a tire
+//!   AND mount it). They apply inside one savepoint: all or none.
+//! * Everything else is per-op: applied / conflict / error, each in its own
+//!   savepoint, so one bad op never takes its batch-mates down.
+//! * A transient database failure (deadlock, lock timeout, lost connection)
+//!   fails the WHOLE request with 503. It is not the op's fault and must not
+//!   be dead-lettered by the client.
+//! * Clients that predate `op_id` (≤ v0.2.3) keep working through the
+//!   version-arithmetic replay rules in `legacy_replay`.
 //!
-//! Pull: server returns rows where updated_at > since, ordered by updated_at,
-//! up to `limit`. Client advances cursor to MAX(updated_at) of returned rows.
+//! PULL
+//! Keyset over (updated_at, pk). updated_at is stamped by a trigger with
+//! clock_timestamp() under one advisory lock (migration 0021), so commit order
+//! equals cursor order and a cursor can never advance past an uncommitted row.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
-use crate::services::side_effects;
+use crate::handlers::sync_helpers as sql;
+use crate::services::{rules, side_effects};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,15 +70,35 @@ impl EntityType {
         }
     }
 
-    /// Tables that upsert on PK conflict rather than insert (PK-keyed singletons).
-    pub fn upserts_on_conflict(self) -> bool {
+    /// SQL cast for a text-bound PK parameter. Comparing `pk = $1::uuid` keeps
+    /// the primary-key index usable; the old `pk::text = $1` forced a
+    /// sequential scan several times per op.
+    pub fn pk_cast(self) -> &'static str {
+        if self.is_singleton() {
+            "::integer"
+        } else {
+            "::uuid"
+        }
+    }
+
+    /// PK-keyed singletons (one row per vehicle): an insert upserts.
+    pub fn is_singleton(self) -> bool {
         matches!(self, Self::VehicleClassAssignments | Self::VehicleOdometerOverrides)
     }
 
-    /// Every owned table soft-deletes except the odometer override (PK
-    /// vehicle_id, no tombstone — /sync/push refuses deletes on it).
+    /// Every owned table soft-deletes except the odometer override.
     pub fn has_deleted_at(self) -> bool {
         !matches!(self, Self::VehicleOdometerOverrides)
+    }
+
+    /// Canonical form of a PK, or None when it is not a valid key for this
+    /// entity. UUIDs are lower-cased so `ABC…` and `abc…` are the same row.
+    pub fn canonical_id(self, raw: &str) -> Option<String> {
+        if self.is_singleton() {
+            raw.trim().parse::<i32>().ok().filter(|n| *n > 0).map(|n| n.to_string())
+        } else {
+            Uuid::parse_str(raw.trim()).ok().map(|u| u.to_string())
+        }
     }
 }
 
@@ -79,30 +113,52 @@ pub enum SyncOperation {
 #[derive(Debug, Deserialize)]
 pub struct PushOperation {
     pub entity_type: EntityType,
-    /// PK as string (UUID for most tables, integer for vehicle_odometer_overrides).
+    /// PK as string (UUID for most tables, integer for the per-vehicle singletons).
     pub entity_id: String,
     pub operation: SyncOperation,
+    #[serde(default)]
     pub payload: Value,
-    /// Client's current sync_version. For Insert, set to 0 (server will accept any value
-    /// since the row doesn't exist yet).
+    /// The sync_version the client based this op on (0 for inserts).
+    #[serde(default)]
     pub sync_version: i64,
+    /// Client-minted idempotency key. Absent on clients ≤ v0.2.3.
+    #[serde(default)]
+    pub op_id: Option<Uuid>,
+    /// Ops sharing a group_id (and adjacent in the batch) apply atomically.
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PushResultStatus {
     Applied {
         entity_id: String,
         new_sync_version: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        op_id: Option<Uuid>,
     },
     Conflict {
         entity_id: String,
         server_row: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        op_id: Option<Uuid>,
     },
     Error {
         entity_id: String,
+        /// Stable machine code (see `rules::codes`); clients translate it.
+        #[serde(default)]
+        code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        op_id: Option<Uuid>,
     },
+}
+
+impl PushResultStatus {
+    pub fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied { .. })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,21 +168,17 @@ pub struct PushBody {
 
 #[derive(Debug, Serialize)]
 pub struct PushResponse {
+    /// One result per op, in request order.
     pub results: Vec<PushResultStatus>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PullQuery {
     pub entity_type: EntityType,
-    /// ISO-8601 timestamp; default = epoch.
     #[serde(default)]
     pub since: Option<DateTime<Utc>>,
-    /// PK (as text) of the last row of the previous page. Together with `since`
-    /// this forms a composite keyset cursor — REQUIRED for correct paging,
-    /// because rows written in one transaction share a byte-identical
-    /// updated_at (Postgres now() is transaction_timestamp()), and a
-    /// timestamp-only `>` cursor silently skips the remainder of such a group
-    /// at every page boundary.
+    /// PK (text) of the last row of the previous page; with `since` it forms
+    /// the keyset cursor.
     #[serde(default)]
     pub after_id: Option<String>,
     #[serde(default = "default_limit")]
@@ -141,436 +193,443 @@ fn default_limit() -> i64 {
 pub struct PullResponse {
     pub entity_type: EntityType,
     pub rows: Vec<Value>,
-    /// updated_at of the last returned row; pass back as `since`.
-    /// Null when rows is empty.
     pub next_cursor: Option<DateTime<Utc>>,
-    /// PK (text) of the last returned row; pass back as `after_id`.
     pub next_cursor_id: Option<String>,
     pub has_more: bool,
 }
 
-/// Apply a whole push batch: one outer transaction, one SAVEPOINT per operation.
-///
-/// The savepoints are the load-bearing part. Without them, the first statement
-/// that trips a Postgres constraint aborts the surrounding transaction (25P02):
-/// the per-op `Error` result was produced, but every LATER statement in the
-/// batch then failed with "current transaction is aborted" and the client got
-/// one opaque 500 instead of per-op results. Unique violations were worse —
-/// they map to ApiError::Conflict, which propagated and rolled back the entire
-/// batch. With a savepoint around each op, a failed op rolls back only itself
-/// and the batch keeps its promise: independent per-op results.
+/// Hard cap on ops per request. The client sends 50; anything far above that
+/// is a bug or abuse, and one transaction holding the feed lock that long
+/// would stall every other device.
+pub const MAX_OPS_PER_PUSH: usize = 500;
+
+/// What an op did, before it is turned into a wire result.
+enum Outcome {
+    Applied { new_sync_version: i64, stock_moved: bool },
+    Conflict { server_row: Value },
+    Rejected { code: &'static str, message: String },
+}
+
+fn rejected(code: &'static str, message: impl Into<String>) -> Outcome {
+    Outcome::Rejected { code, message: message.into() }
+}
+
+fn wire(op: &PushOperation, entity_id: &str, o: &Outcome) -> PushResultStatus {
+    match o {
+        Outcome::Applied { new_sync_version, .. } => PushResultStatus::Applied {
+            entity_id: entity_id.to_string(),
+            new_sync_version: *new_sync_version,
+            op_id: op.op_id,
+        },
+        Outcome::Conflict { server_row } => PushResultStatus::Conflict {
+            entity_id: entity_id.to_string(),
+            server_row: server_row.clone(),
+            op_id: op.op_id,
+        },
+        Outcome::Rejected { code, message } => PushResultStatus::Error {
+            entity_id: entity_id.to_string(),
+            code: (*code).to_string(),
+            message: message.clone(),
+            op_id: op.op_id,
+        },
+    }
+}
+
+/// Apply a whole push batch. Returns the per-op results and whether any stock
+/// movement was recorded (the caller mirrors those to Falcon after commit).
 pub async fn apply_push_batch(
     pool: &PgPool,
     body: &PushBody,
     user_id: i64,
-) -> ApiResult<(PushResponse, Vec<Uuid>)> {
-    let mut tx = pool.begin().await?;
-    let mut results = Vec::with_capacity(body.operations.len());
-    // Stock movements recorded by side effects; mirrored to Falcon by the
-    // caller AFTER the outer transaction commits (never network inside a txn).
-    let mut debit_refs: Vec<Uuid> = Vec::new();
-    for op in &body.operations {
-        // sqlx: Transaction::begin on a &mut Transaction issues a SAVEPOINT.
-        let mut sp = tx.begin().await?;
-        match apply_push_operation(&mut sp, op, user_id).await {
-            Ok((r, refs)) => {
-                // Commit ONLY when the op applied. A per-op Error is often a
-                // constraint violation that apply_push_operation swallowed into
-                // a result — the subtransaction is already aborted underneath,
-                // and RELEASE SAVEPOINT on an aborted subtransaction is itself
-                // a 25P02. Rolling back Error/Conflict discards nothing (those
-                // paths wrote nothing durable) and always leaves the outer
-                // transaction healthy.
-                match &r {
-                    PushResultStatus::Applied { .. } => {
-                        sp.commit().await?;
-                        debit_refs.extend(refs);
-                    }
-                    _ => sp.rollback().await?,
-                }
-                results.push(r);
-            }
-            Err(e) => {
-                sp.rollback().await?;
-                results.push(PushResultStatus::Error {
-                    entity_id: op.entity_id.clone(),
-                    message: e.to_string(),
-                });
+) -> ApiResult<(PushResponse, bool)> {
+    if body.operations.len() > MAX_OPS_PER_PUSH {
+        return Err(ApiError::BadRequest(format!(
+            "too many operations in one push (max {MAX_OPS_PER_PUSH})"
+        )));
+    }
+    let mut tx = pool.begin().await.map_err(transient_or_db)?;
+    let mut results: Vec<PushResultStatus> = Vec::with_capacity(body.operations.len());
+    let mut stock_moved = false;
+
+    let ops = &body.operations;
+    let mut i = 0;
+    while i < ops.len() {
+        // A unit = one op, or a run of adjacent ops sharing a group_id.
+        let mut j = i + 1;
+        if let Some(g) = ops[i].group_id {
+            while j < ops.len() && ops[j].group_id == Some(g) {
+                j += 1;
             }
         }
+        let unit = &ops[i..j];
+
+        // sqlx: Transaction::begin on a &mut Transaction issues a SAVEPOINT.
+        let mut sp = tx.begin().await.map_err(transient_or_db)?;
+        let mut unit_results: Vec<PushResultStatus> = Vec::with_capacity(unit.len());
+        let mut unit_ok = true;
+        let mut unit_moved = false;
+        for op in unit {
+            let entity_id = op
+                .entity_type
+                .canonical_id(&op.entity_id)
+                .unwrap_or_else(|| op.entity_id.clone());
+            let outcome = match apply_one(&mut sp, op, user_id).await {
+                Ok(o) => o,
+                Err(e) => match classify(e) {
+                    Classified::Transient(e) => return Err(e),
+                    Classified::Rejected(code, message) => rejected(code, message),
+                },
+            };
+            if let Outcome::Applied { stock_moved: m, .. } = &outcome {
+                unit_moved |= *m;
+            } else {
+                unit_ok = false;
+            }
+            unit_results.push(wire(op, &entity_id, &outcome));
+            if !unit_ok {
+                break;
+            }
+        }
+
+        if unit_ok {
+            sp.commit().await.map_err(transient_or_db)?;
+            stock_moved |= unit_moved;
+        } else {
+            // Rolls back everything the unit wrote, and clears an aborted
+            // subtransaction so the outer transaction stays healthy.
+            sp.rollback().await.map_err(transient_or_db)?;
+            if unit.len() > 1 {
+                let failed_at = unit_results.len() - 1;
+                let failed = unit_results.pop().expect("at least the failing result");
+                unit_results.clear();
+                for (k, op) in unit.iter().enumerate() {
+                    if k == failed_at {
+                        unit_results.push(failed.clone());
+                    } else {
+                        unit_results.push(PushResultStatus::Error {
+                            entity_id: op.entity_id.clone(),
+                            code: rules::codes::GROUP_ROLLED_BACK.to_string(),
+                            message: "another change in the same action was refused".into(),
+                            op_id: op.op_id,
+                        });
+                    }
+                }
+            }
+        }
+        results.extend(unit_results);
+        i = j;
     }
-    tx.commit().await?;
-    Ok((PushResponse { results }, debit_refs))
+    tx.commit().await.map_err(transient_or_db)?;
+    Ok((PushResponse { results }, stock_moved))
 }
 
-/// Postgres text and jsonb both reject the NUL byte (U+0000) — a client
-/// sending one in any string field would 500 at the encoding layer (found by
-/// API fuzzing). Recurse the payload so the op dead-letters cleanly instead.
-fn json_has_nul(v: &Value) -> bool {
-    match v {
-        Value::String(s) => s.contains('\0'),
-        Value::Array(a) => a.iter().any(json_has_nul),
-        Value::Object(o) => o.keys().any(|k| k.contains('\0')) || o.values().any(json_has_nul),
+enum Classified {
+    Transient(ApiError),
+    Rejected(&'static str, String),
+}
+
+/// SQLSTATEs that say "try again", not "this op is wrong".
+fn is_transient_db(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => matches!(
+            db.code().as_deref(),
+            Some("40001" | "40P01" | "55P03" | "57014" | "57P01" | "57P02" | "57P03" | "53300" | "08006" | "08003")
+        ),
+        sqlx::Error::Io(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
         _ => false,
     }
 }
 
-/// Apply a single push operation inside an existing transaction.
-///
-/// Returns the per-op result (applied / conflict / error). Errors are returned
-/// as Ok(PushResultStatus::Error) — the *transaction* itself is rolled back only
-/// for unrecoverable DB errors, which propagate as Err.
-pub async fn apply_push_operation(
+fn transient_or_db(e: sqlx::Error) -> ApiError {
+    if is_transient_db(&e) {
+        tracing::warn!(error = %e, "transient database failure during push");
+        ApiError::Unavailable("database busy, retry".into())
+    } else {
+        ApiError::Db(e)
+    }
+}
+
+/// Turn a failure inside one op into either a whole-request retry or a per-op
+/// rejection with a stable code and a message that leaks no SQL.
+fn classify(e: ApiError) -> Classified {
+    match e {
+        ApiError::Db(db) if is_transient_db(&db) => {
+            tracing::warn!(error = %db, "transient database failure during push");
+            Classified::Transient(ApiError::Unavailable("database busy, retry".into()))
+        }
+        ApiError::Unavailable(m) => Classified::Transient(ApiError::Unavailable(m)),
+        ApiError::Db(db) => {
+            let (code, msg) = rules::explain_db_error(&db);
+            if code == rules::codes::INTERNAL {
+                tracing::error!(error = %db, "unexpected database error applying a sync op");
+            }
+            Classified::Rejected(code, msg)
+        }
+        ApiError::BadRequest(m) => Classified::Rejected(rules::codes::VALIDATION, m),
+        ApiError::Conflict(m) => Classified::Rejected(rules::codes::CONFLICT, m),
+        ApiError::NotFound(m) => Classified::Rejected(rules::codes::NOT_FOUND, m),
+        ApiError::Rule { code, message } => Classified::Rejected(code, message),
+        other => {
+            tracing::error!(error = %other, "unexpected error applying a sync op");
+            Classified::Rejected(rules::codes::INTERNAL, "internal error".into())
+        }
+    }
+}
+
+/// Apply one op inside the caller's savepoint.
+async fn apply_one(
     tx: &mut Transaction<'_, Postgres>,
     op: &PushOperation,
     user_id: i64,
-) -> ApiResult<(PushResultStatus, Vec<Uuid>)> {
-    let table = op.entity_type.table_name();
-    let pk = op.entity_type.pk_column();
+) -> ApiResult<Outcome> {
+    let entity = op.entity_type;
+    let Some(entity_id) = entity.canonical_id(&op.entity_id) else {
+        return Ok(rejected(rules::codes::VALIDATION, "entity_id is not a valid key"));
+    };
 
-    // Read the current row (if any) inside the same transaction so concurrent
-    // writers don't race us.
-    let row_now = fetch_row_json(&mut **tx, table, pk, &op.entity_id).await?;
-
-    let no_refs: Vec<Uuid> = Vec::new();
-
-    // A NUL byte anywhere in the payload can't be stored (text/jsonb) — reject
-    // the op, never crash the batch.
-    if json_has_nul(&op.payload) {
-        return Ok((
-            PushResultStatus::Error {
-                entity_id: op.entity_id.clone(),
-                message: "payload contains a NUL byte".into(),
-            },
-            no_refs,
-        ));
+    // Exactly-once: an op we already applied returns what it returned then.
+    if let Some(op_id) = op.op_id {
+        let stored: Option<(Value,)> =
+            sqlx::query_as("SELECT result FROM sync_applied_ops WHERE op_id = $1")
+                .bind(op_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some((v,)) = stored {
+            let sv = v.get("new_sync_version").and_then(Value::as_i64).unwrap_or(0);
+            return Ok(Outcome::Applied { new_sync_version: sv, stock_moved: false });
+        }
     }
 
-    match op.operation {
-        SyncOperation::Insert => {
-            if row_now.is_some() && !op.entity_type.upserts_on_conflict() {
-                // Idempotent insert: if sync_version matches, treat as no-op
-                // applied. Side effects do NOT re-run — the original apply
-                // already recorded them (and debits dedupe on ref_id anyway).
-                //
-                // The (0, 1) case is the lost-ack replay: clients send inserts
-                // with sync_version 0, the row lands at DEFAULT 1, and the
-                // redelivered insert must ack as a no-op — not manufacture a
-                // conflict dead-letter for a write that succeeded.
-                let server_sv = row_now
-                    .as_ref()
-                    .and_then(|v| v.get("sync_version"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                if op.sync_version == server_sv || (op.sync_version == 0 && server_sv == 1) {
-                    return Ok((
-                        PushResultStatus::Applied {
-                            entity_id: op.entity_id.clone(),
-                            new_sync_version: server_sv,
-                        },
-                        no_refs,
-                    ));
+    if rules::json_has_nul(&op.payload) {
+        return Ok(rejected(rules::codes::VALIDATION, "text contains an unsupported character"));
+    }
+
+    // Lock the row for the rest of the savepoint: the version check and the
+    // write below see the same row no concurrent push can change in between.
+    let row_now = fetch_row_json(&mut **tx, entity, &entity_id, true).await?;
+
+    let outcome = match op.operation {
+        SyncOperation::Insert => apply_insert(tx, op, &entity_id, row_now, user_id).await?,
+        SyncOperation::Update => apply_update(tx, op, &entity_id, row_now, user_id).await?,
+        SyncOperation::Delete => apply_delete(tx, op, &entity_id, row_now, user_id).await?,
+    };
+
+    if let (Some(op_id), Outcome::Applied { new_sync_version, .. }) = (op.op_id, &outcome) {
+        sqlx::query(
+            "INSERT INTO sync_applied_ops (op_id, user_id, entity_type, entity_id, result) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (op_id) DO NOTHING",
+        )
+        .bind(op_id)
+        .bind(user_id)
+        .bind(entity.table_name())
+        .bind(&entity_id)
+        .bind(json!({ "new_sync_version": new_sync_version }))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(outcome)
+}
+
+fn sv_of(row: &Value) -> i64 {
+    row.get("sync_version").and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn is_tombstone(row: &Value) -> bool {
+    row.get("deleted_at").map(|v| !v.is_null()).unwrap_or(false)
+}
+
+async fn apply_insert(
+    tx: &mut Transaction<'_, Postgres>,
+    op: &PushOperation,
+    entity_id: &str,
+    row_now: Option<Value>,
+    user_id: i64,
+) -> ApiResult<Outcome> {
+    let entity = op.entity_type;
+    if let Some(row) = &row_now {
+        if !entity.is_singleton() {
+            // Pre-op_id clients: a redelivered insert carries sync_version 0
+            // against a row at its DEFAULT 1 (or the version it already knew).
+            let server_sv = sv_of(row);
+            if op.op_id.is_none() && (op.sync_version == server_sv || (op.sync_version == 0 && server_sv == 1)) {
+                // Those clients also fold later edits into a still-pending
+                // insert. If the redelivery carries values the stored row
+                // lacks, they are edits made after the first delivery: apply
+                // them rather than acknowledge and lose them.
+                if op.payload.is_object() && !is_tombstone(row) {
+                    let mut edits = op.payload.clone();
+                    if rules::normalize(entity, SyncOperation::Update, &mut edits, Some(row)).is_ok()
+                        && !sql::payload_matches_row(entity, &edits, row)
+                    {
+                        return write_update(tx, entity, entity_id, &edits, row, user_id).await;
+                    }
                 }
-                return Ok((
-                    PushResultStatus::Conflict {
-                        entity_id: op.entity_id.clone(),
-                        server_row: row_now.unwrap_or(Value::Null),
-                    },
-                    no_refs,
-                ));
+                return Ok(Outcome::Applied { new_sync_version: server_sv, stock_moved: false });
             }
-            // A payload MUST be a JSON object — anything else (array, scalar)
-            // is a malformed op. serde_json's IndexMut below panics on a
-            // non-object, so reject cleanly here (found by API fuzzing: an
-            // array payload crashed the whole server).
-            let Some(obj) = op.payload.as_object() else {
-                return Ok((
-                    PushResultStatus::Error {
-                        entity_id: op.entity_id.clone(),
-                        message: "payload must be a JSON object".into(),
-                    },
-                    no_refs,
-                ));
-            };
-            // Server-owned derived fields (e.g. the oil flag) override the client.
-            let mut payload = Value::Object(obj.clone());
-            // The ack is keyed on entity_id, so the row MUST land under it. A
-            // payload missing or contradicting its own PK would otherwise
-            // insert under a table-default UUID — acked under an id it doesn't
-            // bear, and re-inserted on every redelivery (the idempotency check
-            // above looks up entity_id and finds nothing).
-            payload[op.entity_type.pk_column()] = Value::String(op.entity_id.clone());
-            side_effects::normalize_insert(op.entity_type, &mut payload);
-            // Build column list from payload, force audit columns server-side.
-            match generic_insert(tx, op.entity_type, &payload, user_id).await {
-                Ok(new_sv) => {
-                    let refs = side_effects::after_apply(tx, op, &payload, None).await?;
-                    Ok((
-                        PushResultStatus::Applied {
-                            entity_id: op.entity_id.clone(),
-                            new_sync_version: new_sv,
-                        },
-                        refs,
-                    ))
-                }
-                Err(ApiError::BadRequest(m)) => Ok((
-                    PushResultStatus::Error {
-                        entity_id: op.entity_id.clone(),
-                        message: m,
-                    },
-                    no_refs,
-                )),
-                Err(e) => Err(e),
-            }
+            return Ok(Outcome::Conflict { server_row: row.clone() });
         }
-        SyncOperation::Update => {
-            let row_now = match row_now {
-                Some(r) => r,
-                None => {
-                    return Ok((
-                        PushResultStatus::Error {
-                            entity_id: op.entity_id.clone(),
-                            message: "row not found".into(),
-                        },
-                        no_refs,
-                    ));
-                }
-            };
-            let server_sv = row_now
-                .get("sync_version")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            if server_sv != op.sync_version {
-                return Ok((
-                    PushResultStatus::Conflict {
-                        entity_id: op.entity_id.clone(),
-                        server_row: row_now,
-                    },
-                    no_refs,
-                ));
-            }
-            // Server-owned derived fields (the oil flag) are stripped or
-            // recomputed — the client may never overwrite them on update.
-            let mut payload = op.payload.clone();
-            side_effects::normalize_update(op.entity_type, &mut payload);
-            match generic_update(tx, op.entity_type, &op.entity_id, &payload, user_id, server_sv)
-                .await
-            {
-                Ok(Some(new_sv)) => {
-                    let refs = side_effects::after_apply(tx, op, &payload, Some(&row_now)).await?;
-                    Ok((
-                        PushResultStatus::Applied {
-                            entity_id: op.entity_id.clone(),
-                            new_sync_version: new_sv,
-                        },
-                        refs,
-                    ))
-                }
-                // The guarded UPDATE matched no row: a concurrent batch
-                // committed between our read and this statement. Re-read and
-                // report the conflict instead of silently overwriting.
-                Ok(None) => {
-                    let fresh = fetch_row_json(&mut **tx, table, pk, &op.entity_id).await?;
-                    Ok((
-                        match fresh {
-                            Some(server_row) => PushResultStatus::Conflict {
-                                entity_id: op.entity_id.clone(),
-                                server_row,
-                            },
-                            None => PushResultStatus::Error {
-                                entity_id: op.entity_id.clone(),
-                                message: "row not found".into(),
-                            },
-                        },
-                        no_refs,
-                    ))
-                }
-                Err(ApiError::BadRequest(m)) => Ok((
-                    PushResultStatus::Error {
-                        entity_id: op.entity_id.clone(),
-                        message: m,
-                    },
-                    no_refs,
-                )),
-                Err(e) => Err(e),
-            }
+    }
+    let Some(obj) = op.payload.as_object() else {
+        return Ok(rejected(rules::codes::VALIDATION, "payload must be a JSON object"));
+    };
+    let mut payload = Value::Object(obj.clone());
+    // The ack is keyed on entity_id, so the row MUST land under it.
+    payload[entity.pk_column()] = Value::String(entity_id.to_string());
+    if let Err(m) = rules::normalize(entity, SyncOperation::Insert, &mut payload, None) {
+        return Ok(rejected(rules::codes::VALIDATION, m));
+    }
+    if let Some(reject) = side_effects::before_insert(tx, entity, &mut payload).await? {
+        return Ok(rejected(reject.0, reject.1));
+    }
+    let new_sv = sql::insert_from_payload(tx, entity, &payload, user_id).await?;
+    let moved =
+        side_effects::after_apply(tx, entity, SyncOperation::Insert, entity_id, &payload, row_now.as_ref(), user_id)
+            .await?;
+    Ok(Outcome::Applied { new_sync_version: new_sv, stock_moved: moved })
+}
+
+async fn apply_update(
+    tx: &mut Transaction<'_, Postgres>,
+    op: &PushOperation,
+    entity_id: &str,
+    row_now: Option<Value>,
+    user_id: i64,
+) -> ApiResult<Outcome> {
+    let entity = op.entity_type;
+    let Some(row_now) = row_now else {
+        return Ok(rejected(rules::codes::NOT_FOUND, "the record does not exist on the server"));
+    };
+    if !op.payload.is_object() {
+        return Ok(rejected(rules::codes::VALIDATION, "payload must be a JSON object"));
+    }
+    let mut payload = op.payload.clone();
+    if let Err(m) = rules::normalize(entity, SyncOperation::Update, &mut payload, Some(&row_now)) {
+        return Ok(rejected(rules::codes::VALIDATION, m));
+    }
+    let server_sv = sv_of(&row_now);
+    if server_sv != op.sync_version {
+        // Pre-op_id clients: the update already applied (version moved by
+        // exactly one and the stored row equals what was sent) — a lost ack,
+        // not a conflict.
+        if op.op_id.is_none()
+            && server_sv == op.sync_version + 1
+            && sql::payload_matches_row(entity, &payload, &row_now)
+        {
+            return Ok(Outcome::Applied { new_sync_version: server_sv, stock_moved: false });
         }
-        SyncOperation::Delete => {
-            let row_now = match row_now {
-                Some(r) => r,
-                None => {
-                    // Already gone — treat as applied for idempotency.
-                    return Ok((
-                        PushResultStatus::Applied {
-                            entity_id: op.entity_id.clone(),
-                            new_sync_version: op.sync_version,
-                        },
-                        no_refs,
-                    ));
-                }
-            };
-            let server_sv = row_now
-                .get("sync_version")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let already_deleted = row_now
-                .get("deleted_at")
-                .map(|v| !v.is_null())
-                .unwrap_or(false);
-            // Lost-ack replay: the delete already applied (sv bumped once past
-            // the client's base and the tombstone is set). Redelivery must ack
-            // as a no-op — the Insert path's (0,1) rule, for deletes. Without
-            // this, every delete acked into a dropped response becomes a
-            // conflict dead-letter on flaky networks.
-            if already_deleted && server_sv == op.sync_version + 1 {
-                return Ok((
-                    PushResultStatus::Applied {
-                        entity_id: op.entity_id.clone(),
-                        new_sync_version: server_sv,
-                    },
-                    no_refs,
-                ));
-            }
-            if server_sv != op.sync_version {
-                return Ok((
-                    PushResultStatus::Conflict {
-                        entity_id: op.entity_id.clone(),
-                        server_row: row_now,
-                    },
-                    no_refs,
-                ));
-            }
-            // Soft delete only; vehicle_odometer_overrides has no deleted_at.
-            if !op.entity_type.has_deleted_at() {
-                return Ok((
-                    PushResultStatus::Error {
-                        entity_id: op.entity_id.clone(),
-                        message: "vehicle_odometer_overrides does not support delete".into(),
-                    },
-                    no_refs,
-                ));
-            }
-            match soft_delete(tx, op.entity_type, &op.entity_id, user_id, server_sv).await? {
-                Some(new_sv) => {
-                    // Deletes have consequences too (e.g. tombstoning an OPEN
-                    // assignment must un-mount the tire).
-                    let refs =
-                        side_effects::after_apply(tx, op, &op.payload, Some(&row_now)).await?;
-                    Ok((
-                        PushResultStatus::Applied {
-                            entity_id: op.entity_id.clone(),
-                            new_sync_version: new_sv,
-                        },
-                        refs,
-                    ))
-                }
-                None => {
-                    let fresh = fetch_row_json(&mut **tx, table, pk, &op.entity_id).await?;
-                    Ok((
-                        match fresh {
-                            Some(server_row) => PushResultStatus::Conflict {
-                                entity_id: op.entity_id.clone(),
-                                server_row,
-                            },
-                            None => PushResultStatus::Applied {
-                                entity_id: op.entity_id.clone(),
-                                new_sync_version: op.sync_version,
-                            },
-                        },
-                        no_refs,
-                    ))
-                }
-            }
+        return Ok(Outcome::Conflict { server_row: row_now });
+    }
+    if entity.has_deleted_at() && is_tombstone(&row_now) {
+        return Ok(rejected(rules::codes::DELETED, "the record was deleted"));
+    }
+    write_update(tx, entity, entity_id, &payload, &row_now, user_id).await
+}
+
+/// The write half of an update: guards, the version-guarded UPDATE, side
+/// effects. `payload` is already normalized; `row_now` is locked.
+async fn write_update(
+    tx: &mut Transaction<'_, Postgres>,
+    entity: EntityType,
+    entity_id: &str,
+    payload: &Value,
+    row_now: &Value,
+    user_id: i64,
+) -> ApiResult<Outcome> {
+    let server_sv = sv_of(row_now);
+    if let Some(reject) = side_effects::before_update(tx, entity, entity_id, payload, row_now).await? {
+        return Ok(rejected(reject.0, reject.1));
+    }
+    match sql::update_from_payload(tx, entity, entity_id, payload, user_id, server_sv).await? {
+        Some(new_sv) => {
+            let moved = side_effects::after_apply(
+                tx, entity, SyncOperation::Update, entity_id, payload, Some(row_now), user_id,
+            )
+            .await?;
+            Ok(Outcome::Applied { new_sync_version: new_sv, stock_moved: moved })
         }
+        // Unreachable while the row lock is held; kept as a correct fallback.
+        None => match fetch_row_json(&mut **tx, entity, entity_id, false).await? {
+            Some(server_row) => Ok(Outcome::Conflict { server_row }),
+            None => Ok(rejected(rules::codes::NOT_FOUND, "the record does not exist on the server")),
+        },
+    }
+}
+
+async fn apply_delete(
+    tx: &mut Transaction<'_, Postgres>,
+    op: &PushOperation,
+    entity_id: &str,
+    row_now: Option<Value>,
+    user_id: i64,
+) -> ApiResult<Outcome> {
+    let entity = op.entity_type;
+    // Already gone: deleting nothing is a success.
+    let Some(row_now) = row_now else {
+        return Ok(Outcome::Applied { new_sync_version: op.sync_version, stock_moved: false });
+    };
+    if !entity.has_deleted_at() {
+        return Ok(rejected(rules::codes::VALIDATION, "an odometer correction cannot be deleted; set a new one"));
+    }
+    let server_sv = sv_of(&row_now);
+    if is_tombstone(&row_now) {
+        // Deleted already (by this op's lost first delivery, or by another
+        // device). Either way the client's intent holds.
+        return Ok(Outcome::Applied { new_sync_version: server_sv, stock_moved: false });
+    }
+    if server_sv != op.sync_version {
+        return Ok(Outcome::Conflict { server_row: row_now });
+    }
+    if let Some(reject) = side_effects::before_delete(tx, entity, entity_id, &row_now).await? {
+        return Ok(rejected(reject.0, reject.1));
+    }
+    match sql::soft_delete(tx, entity, entity_id, user_id, server_sv).await? {
+        Some(new_sv) => {
+            let moved = side_effects::after_apply(
+                tx, entity, SyncOperation::Delete, entity_id, &op.payload, Some(&row_now), user_id,
+            )
+            .await?;
+            Ok(Outcome::Applied { new_sync_version: new_sv, stock_moved: moved })
+        }
+        None => match fetch_row_json(&mut **tx, entity, entity_id, false).await? {
+            Some(server_row) => Ok(Outcome::Conflict { server_row }),
+            None => Ok(Outcome::Applied { new_sync_version: op.sync_version, stock_moved: false }),
+        },
     }
 }
 
 async fn fetch_row_json<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
-    table: &str,
-    pk: &str,
+    entity: EntityType,
     pk_value: &str,
+    for_update: bool,
 ) -> ApiResult<Option<Value>> {
-    // Use to_jsonb for a generic single-row JSON. PK type is auto-cast by Postgres
-    // because UUID/INT both accept text inputs through ::uuid / ::int.
-    let q = format!(
-        "SELECT to_jsonb(t) AS row FROM {table} t WHERE {pk}::text = $1 LIMIT 1"
-    );
+    let table = entity.table_name();
+    let pk = entity.pk_column();
+    let cast = entity.pk_cast();
+    let lock = if for_update { " FOR UPDATE" } else { "" };
+    let q = format!("SELECT to_jsonb(t) AS row FROM {table} t WHERE {pk} = $1{cast}{lock}");
     let opt: Option<(Value,)> = sqlx::query_as(&q).bind(pk_value).fetch_optional(exec).await?;
     Ok(opt.map(|t| t.0))
 }
 
-/// The server's current row for one synced entity, exactly as a push conflict
-/// would report it (soft-deleted rows included — `deleted_at` says so). Used
-/// by GET /records/{entity_type}/{entity_id}.
+/// The server's current row for one synced entity (soft-deleted rows
+/// included). Used by GET /records/{entity_type}/{entity_id}.
 pub async fn fetch_record(
     pool: &PgPool,
     entity: EntityType,
     entity_id: &str,
 ) -> ApiResult<Option<Value>> {
-    fetch_row_json(pool, entity.table_name(), entity.pk_column(), entity_id).await
+    let Some(id) = entity.canonical_id(entity_id) else {
+        return Err(ApiError::BadRequest("entity_id is not a valid key".into()));
+    };
+    fetch_row_json(pool, entity, &id, false).await
 }
 
-/// Generic INSERT for an entity from a JSON payload.
-///
-/// We trust the client's UUID PK (offline-first §7.1). All audit columns and
-/// sync_version are server-assigned.
-async fn generic_insert(
-    tx: &mut Transaction<'_, Postgres>,
-    entity: EntityType,
-    payload: &Value,
-    user_id: i64,
-) -> ApiResult<i64> {
-    use crate::handlers::sync_helpers as h;
-    h::insert_from_payload(tx, entity, payload, user_id).await
-}
-
-async fn generic_update(
-    tx: &mut Transaction<'_, Postgres>,
-    entity: EntityType,
-    entity_id: &str,
-    payload: &Value,
-    user_id: i64,
-    expected_sync_version: i64,
-) -> ApiResult<Option<i64>> {
-    use crate::handlers::sync_helpers as h;
-    h::update_from_payload(tx, entity, entity_id, payload, user_id, expected_sync_version).await
-}
-
-/// Version-guarded tombstone. None = the guard matched no row (concurrent
-/// writer won, or the row vanished) — caller re-reads and reports.
-async fn soft_delete(
-    tx: &mut Transaction<'_, Postgres>,
-    entity: EntityType,
-    entity_id: &str,
-    user_id: i64,
-    expected_sync_version: i64,
-) -> ApiResult<Option<i64>> {
-    let table = entity.table_name();
-    let pk = entity.pk_column();
-    let q = format!(
-        r#"
-        UPDATE {table}
-           SET deleted_at = now(),
-               updated_at = now(),
-               updated_by_user_id = $1,
-               sync_version = sync_version + 1
-         WHERE {pk}::text = $2 AND sync_version = $3
-         RETURNING sync_version
-        "#
-    );
-    let sv: Option<(i64,)> = sqlx::query_as(&q)
-        .bind(user_id)
-        .bind(entity_id)
-        .bind(expected_sync_version)
-        .fetch_optional(&mut **tx)
-        .await?;
-    Ok(sv.map(|t| t.0))
-}
-
-/// Cursor-based incremental pull with a composite (updated_at, pk) keyset.
-///
-/// All rows are returned, including soft-deleted ones (clients need tombstones).
+/// Incremental pull with a composite (updated_at, pk) keyset. Soft-deleted
+/// rows are included: clients need the tombstones.
 pub async fn pull_rows(
     pool: &PgPool,
     entity: EntityType,
@@ -580,30 +639,27 @@ pub async fn pull_rows(
 ) -> ApiResult<PullResponse> {
     let table = entity.table_name();
     let pk = entity.pk_column();
+    let cast = entity.pk_cast();
 
-    // Row-value comparison makes the keyset exact: strictly after the last row
-    // we handed out, even when many rows share one updated_at. Without
-    // after_id (first page) a plain > on the timestamp is correct.
-    let rows: Vec<(Value, DateTime<Utc>, String)> = if let Some(aid) = after_id {
+    // A malformed after_id is ignored (falls back to the timestamp cursor)
+    // rather than failing the pull forever.
+    let after = after_id.and_then(|a| entity.canonical_id(a));
+    let rows: Vec<(Value, DateTime<Utc>, String)> = if let Some(aid) = after {
         let q = format!(
-            r#"
-            SELECT to_jsonb(t) AS row, updated_at, {pk}::text AS pk_text
-              FROM {table} t
-             WHERE (updated_at, {pk}::text) > ($1, $2)
-             ORDER BY updated_at ASC, {pk}::text ASC
-             LIMIT $3
-            "#
+            "SELECT to_jsonb(t) AS row, updated_at, {pk}::text AS pk_text
+               FROM {table} t
+              WHERE (updated_at, {pk}) > ($1, $2{cast})
+              ORDER BY updated_at ASC, {pk} ASC
+              LIMIT $3"
         );
         sqlx::query_as(&q).bind(since).bind(aid).bind(limit).fetch_all(pool).await?
     } else {
         let q = format!(
-            r#"
-            SELECT to_jsonb(t) AS row, updated_at, {pk}::text AS pk_text
-              FROM {table} t
-             WHERE updated_at > $1
-             ORDER BY updated_at ASC, {pk}::text ASC
-             LIMIT $2
-            "#
+            "SELECT to_jsonb(t) AS row, updated_at, {pk}::text AS pk_text
+               FROM {table} t
+              WHERE updated_at > $1
+              ORDER BY updated_at ASC, {pk} ASC
+              LIMIT $2"
         );
         sqlx::query_as(&q).bind(since).bind(limit).fetch_all(pool).await?
     };
@@ -622,22 +678,32 @@ pub async fn pull_rows(
 }
 
 #[cfg(test)]
-mod nul_tests {
-    use super::json_has_nul;
-    use serde_json::json;
+mod tests {
+    use super::*;
 
     #[test]
-    fn detects_nul_everywhere_and_nowhere() {
-        // clean
-        assert!(!json_has_nul(&json!({"title": "hello", "n": 5, "ok": true, "x": null})));
-        assert!(!json_has_nul(&json!([1, "a", {"b": "c"}])));
-        // string value
-        assert!(json_has_nul(&json!({"title": "a\u{0000}b"})));
-        // array element
-        assert!(json_has_nul(&json!(["ok", "bad\u{0000}"])));
-        // nested object value
-        assert!(json_has_nul(&json!({"a": {"b": "x\u{0000}y"}})));
-        // OBJECT KEY — the easily-missed branch
-        assert!(json_has_nul(&json!({"k\u{0000}": 1})));
+    fn canonical_ids() {
+        let e = EntityType::Tires;
+        assert_eq!(
+            e.canonical_id("  3F2504E0-4F89-41D3-9A0C-0305E82C3301 ").as_deref(),
+            Some("3f2504e0-4f89-41d3-9a0c-0305e82c3301")
+        );
+        assert!(e.canonical_id("12").is_none());
+        let s = EntityType::VehicleOdometerOverrides;
+        assert_eq!(s.canonical_id("12").as_deref(), Some("12"));
+        assert!(s.canonical_id("0").is_none());
+        assert!(s.canonical_id("-4").is_none());
+        assert!(s.canonical_id("abc").is_none());
+    }
+
+    #[test]
+    fn op_without_new_fields_still_parses() {
+        // The wire shape of clients <= v0.2.3.
+        let op: PushOperation = serde_json::from_value(json!({
+            "entity_type": "tires", "entity_id": "x", "operation": "insert",
+            "payload": {}, "sync_version": 0
+        }))
+        .unwrap();
+        assert!(op.op_id.is_none() && op.group_id.is_none());
     }
 }

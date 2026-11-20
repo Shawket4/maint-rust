@@ -1,9 +1,10 @@
 //! Service plans (fleet-wide preventive rules). Config CRUD, not offline-synced.
 
-use actix_web::{get, post, web, HttpResponse};
+use actix_web::{delete, get, post, web, HttpResponse};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::auth::claims::level;
 use crate::auth::AuthClaims;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
@@ -22,7 +23,9 @@ async fn list_plans(pool: web::Data<PgPool>) -> ApiResult<HttpResponse> {
 struct PlanInput {
     class_id: String,
     category_id: String,
-    trigger_type: String,
+    /// Ignored: derived from which intervals are set.
+    #[serde(default)]
+    trigger_type: Option<String>,
     interval_km: Option<i32>,
     interval_days: Option<i32>,
     lead_warn_km: Option<i32>,
@@ -36,34 +39,25 @@ async fn upsert_plan(
     claims: AuthClaims,
     body: web::Json<PlanInput>,
 ) -> ApiResult<HttpResponse> {
-    if claims.permission < 3 {
-        return Err(ApiError::Forbidden("service plans require permission >= 3".into()));
+    claims.require(level::CONFIGURE, "service plans")?;
+    let mut p = body.into_inner();
+    // A plan is a km interval, a day interval, or both (whichever comes
+    // first). trigger_type is derived, kept only for older clients.
+    let ok = |v: Option<i32>, max: i32| v.map_or(true, |v| v > 0 && v <= max);
+    if p.interval_km.is_none() && p.interval_days.is_none() {
+        return Err(ApiError::BadRequest("a plan needs interval_km, interval_days, or both".into()));
     }
-    let p = body.into_inner();
-    // Validate BEFORE the DB: an unknown trigger_type used to reach the
-    // `$3::plan_trigger` cast and 500 with a raw db_error (found by API
-    // fuzzing). Reject with a clean 400 instead, and enforce the mileage-XOR-
-    // time interval invariant here rather than relying on the table CHECK to
-    // surface as a 500.
-    match p.trigger_type.as_str() {
-        "mileage" => {
-            if p.interval_km.map_or(true, |v| v <= 0) {
-                return Err(ApiError::BadRequest(
-                    "mileage plan needs interval_km > 0".into(),
-                ));
-            }
-        }
-        "time" => {
-            if p.interval_days.map_or(true, |v| v <= 0) {
-                return Err(ApiError::BadRequest("time plan needs interval_days > 0".into()));
-            }
-        }
-        other => {
-            return Err(ApiError::BadRequest(format!(
-                "trigger_type must be 'mileage' or 'time', got '{other}'"
-            )));
-        }
+    if !ok(p.interval_km, 2_000_000) || !ok(p.interval_days, 3650) {
+        return Err(ApiError::BadRequest("interval_km must be 1..2000000 and interval_days 1..3650".into()));
     }
+    if p.lead_warn_km.map_or(false, |v| v < 0) || p.lead_warn_days.map_or(false, |v| v < 0) {
+        return Err(ApiError::BadRequest("warning lead cannot be negative".into()));
+    }
+    p.trigger_type = Some(if p.interval_km.is_some() { "mileage".into() } else { "time".into() });
+    // A warning lead longer than the interval would keep the plan "due soon"
+    // forever; default it to a tenth of the interval.
+    let lead_km = p.lead_warn_km.or(p.interval_km.map(|k| (k / 10).clamp(100, 2000)));
+    let lead_days = p.lead_warn_days.or(p.interval_days.map(|d| (d / 10).clamp(1, 14)));
     if p.class_id.trim().is_empty() || p.category_id.trim().is_empty() {
         return Err(ApiError::BadRequest("class_id and category_id are required".into()));
     }
@@ -78,7 +72,7 @@ async fn upsert_plan(
             (class_id, category_id, trigger_type, interval_km, interval_days,
              lead_warn_km, lead_warn_days, is_active, created_by_user_id, updated_by_user_id)
         VALUES ($1, $2, $3::plan_trigger, $4, $5,
-                COALESCE($6, 500), COALESCE($7, 14), COALESCE($8, TRUE), $9, $9)
+                COALESCE($6, $10, 500), COALESCE($7, $11, 14), COALESCE($8, TRUE), $9, $9)
         ON CONFLICT (class_id, category_id) DO UPDATE SET
             trigger_type = EXCLUDED.trigger_type,
             interval_km = EXCLUDED.interval_km,
@@ -103,17 +97,39 @@ async fn upsert_plan(
     .bind(p.lead_warn_days)
     .bind(p.is_active)
     .bind(claims.user_id)
+    .bind(lead_km)
+    .bind(lead_days)
     .fetch_one(pool.get_ref())
     .await
     .map_err(|e| match &e {
-        sqlx::Error::Database(db) if db.is_check_violation() => {
-            ApiError::BadRequest(format!("check failed: {}", db.message()))
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+            ApiError::BadRequest("unknown vehicle class or category".into())
         }
         _ => ApiError::Db(e),
     })?;
     Ok(HttpResponse::Ok().json(row.0))
 }
 
+/// Retire a plan. Soft: the row stays for history and can be re-created.
+#[delete("/service-plans/{id}")]
+async fn delete_plan(
+    pool: web::Data<PgPool>,
+    claims: AuthClaims,
+    path: web::Path<uuid::Uuid>,
+) -> ApiResult<HttpResponse> {
+    claims.require(level::CONFIGURE, "service plans")?;
+    let n = sqlx::query(
+        "UPDATE service_plans SET is_active = FALSE, updated_by_user_id = $2, sync_version = sync_version + 1 \
+          WHERE id = $1 AND is_active",
+    )
+    .bind(path.into_inner())
+    .bind(claims.user_id)
+    .execute(pool.get_ref())
+    .await?
+    .rows_affected();
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "removed": n > 0 })))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(list_plans).service(upsert_plan);
+    cfg.service(list_plans).service(upsert_plan).service(delete_plan);
 }

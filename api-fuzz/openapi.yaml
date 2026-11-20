@@ -11,7 +11,7 @@ info:
     paths (/sync/push, /vehicle-classes) carry minimal schemas so stateful
     fuzzing can reach them.
 servers:
-  - url: http://127.0.0.1:8090/api/maint
+  - url: http://127.0.0.1:8095/api/maint
 security:
   - bearerAuth: []
 components:
@@ -135,27 +135,6 @@ paths:
                 liters: { type: number, example: 200 }
                 ref_id: { type: string, format: uuid, nullable: true }
       responses: { "200": { description: ok }, "403": { description: forbidden }, "400": { description: bad } }
-  /stock/debit:
-    post:
-      summary: Debit stock (idempotent on ref_id)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [kind, ref_id]
-              properties:
-                kind: { type: string, enum: [tire_debit, oil_debit] }
-                brand: { type: string, nullable: true }
-                model: { type: string, nullable: true }
-                size: { type: string, nullable: true }
-                oil_type: { type: string, nullable: true }
-                qty: { type: integer, nullable: true }
-                liters: { type: number, nullable: true }
-                ref_id: { type: string, format: uuid }
-                work_order_id: { type: string, format: uuid, nullable: true }
-      responses: { "200": { description: ok }, "400": { description: bad } }
   /sync/pull:
     get:
       summary: Pull owned rows by composite cursor

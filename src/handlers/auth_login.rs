@@ -32,6 +32,10 @@ async fn login(state: web::Data<AppState>, body: web::Json<LoginBody>) -> ApiRes
         // any other type before it even looks at the permission level, and this
         // token is relayed upstream for /api/cars and the stock mirror.
         let (jwt, exp) = token::mint(&state.jwt_secret, user_id, permission, "admin_user", 31)?;
+        // Who this id is, for "opened by" on every screen. Best effort.
+        if let Err(e) = crate::services::legacy_import::remember_user(&state.pool, user_id, &name, permission).await {
+            tracing::warn!(error = %e, "could not record the user's name");
+        }
         return Ok(HttpResponse::Ok().json(json!({
             "jwt": jwt, "exp": exp, "user_id": user_id, "permission": permission, "name": name,
         })));

@@ -1,12 +1,9 @@
 use actix_web::{get, web, HttpResponse};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::auth::middleware::BearerToken;
 use crate::error::ApiResult;
-use crate::falcon::invoices::{
-    fetch_invoices_cached, search_invoices, sync_invoices_into_cache,
-};
+use crate::falcon::invoices::{fetch_invoices_cached, search_invoices};
 use crate::handlers::AppState;
 
 #[derive(Deserialize)]
@@ -34,43 +31,12 @@ async fn get_invoices(
         &state.falcon,
         &state.cache,
         &token.0,
-        q.page,
-        q.limit,
+        q.page.max(1),
+        q.limit.clamp(1, 200),
         state.falcon_invoices_ttl,
     )
     .await?;
     Ok(HttpResponse::Ok().json(v))
-}
-
-#[derive(Deserialize)]
-struct SyncQuery {
-    /// "true" forces a full walk; default is incremental.
-    #[serde(default)]
-    full: bool,
-}
-
-#[get("/cache/service-invoices/sync")]
-async fn sync_invoices(
-    state: web::Data<AppState>,
-    token: BearerToken,
-    q: web::Query<SyncQuery>,
-) -> ApiResult<HttpResponse> {
-    let count = sync_invoices_into_cache(
-        &state.falcon,
-        &state.cache,
-        &state.pool,
-        &token.0,
-        q.full,
-        state.falcon_invoices_ttl,
-    )
-    .await?;
-    // Per §4: invalidate paged proxy cache on sync — the next /cache/service-invoices
-    // request should return fresh data.
-    let _ = state.cache.delete_pattern("falcon:invoices:p*").await;
-    Ok(HttpResponse::Ok().json(json!({
-        "processed": count,
-        "full": q.full,
-    })))
 }
 
 #[derive(Deserialize)]
@@ -89,14 +55,18 @@ async fn search_invoices_handler(
     token: BearerToken,
     q: web::Query<SearchQuery>,
 ) -> ApiResult<HttpResponse> {
+    let query = q.query.trim();
+    if query.is_empty() || query.chars().count() > 100 {
+        return Err(crate::error::ApiError::BadRequest("the search text must be 1 to 100 characters".into()));
+    }
     let v = search_invoices(
         &state.falcon,
         &state.cache,
         &token.0,
-        &q.query,
+        query,
         q.car_id,
-        q.page,
-        q.limit,
+        q.page.max(1),
+        q.limit.clamp(1, 200),
         state.falcon_invoices_ttl,
     )
     .await?;
@@ -104,9 +74,6 @@ async fn search_invoices_handler(
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    // Order matters: more-specific paths must register before less-specific ones,
-    // otherwise actix's path matcher will route /sync to the parameterized handler.
-    cfg.service(sync_invoices)
-        .service(search_invoices_handler)
+    cfg.service(search_invoices_handler)
         .service(get_invoices);
 }

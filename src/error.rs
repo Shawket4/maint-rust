@@ -48,6 +48,17 @@ pub enum ApiError {
     #[error("reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
+    /// Temporary: the caller should retry the same request unchanged.
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
+
+    #[error("{0}")]
+    TooManyRequests(String),
+
+    /// A domain rule refused the change; `code` is stable (services::rules::codes).
+    #[error("{message}")]
+    Rule { code: &'static str, message: String },
+
     #[error("internal error: {0}")]
     #[allow(dead_code)]
     Internal(String),
@@ -57,6 +68,19 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// What a client may read. Database, Redis, HTTP-client and internal
+    /// errors are logged in full and reported generically: their text names
+    /// tables, hosts and upstream bodies.
+    fn public_message(&self) -> String {
+        match self {
+            Self::Db(e) if db_client_fault(e) => "a value in the request is invalid".into(),
+            Self::Db(_) | Self::Redis(_) | Self::Internal(_) | Self::Anyhow(_) => "internal error".into(),
+            Self::Reqwest(_) => "the fleet system could not be reached".into(),
+            Self::UpstreamFalcon { status, .. } => format!("the fleet system answered {status}"),
+            other => other.to_string(),
+        }
+    }
+
     fn error_code(&self) -> &'static str {
         match self {
             Self::Unauthorized(_) => "unauthorized",
@@ -72,6 +96,9 @@ impl ApiError {
             Self::Db(_) => "db_error",
             Self::Redis(_) => "redis_error",
             Self::Reqwest(_) => "reqwest_error",
+            Self::Unavailable(_) => "unavailable",
+            Self::TooManyRequests(_) => "too_many_requests",
+            Self::Rule { code, .. } => code,
             Self::Internal(_) => "internal",
             Self::Anyhow(_) => "internal",
         }
@@ -107,6 +134,9 @@ impl ResponseError for ApiError {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::Rule { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Db(e) if db_client_fault(e) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -126,7 +156,7 @@ impl ResponseError for ApiError {
             }),
             _ => json!({
                 "error": self.error_code(),
-                "message": self.to_string(),
+                "message": self.public_message(),
             }),
         };
 
@@ -139,6 +169,9 @@ impl ResponseError for ApiError {
             Self::Redis(e) => tracing::warn!(error = %e, "redis error"),
             Self::Reqwest(e) => tracing::warn!(error = %e, "upstream reqwest error"),
             Self::Internal(m) => tracing::error!(message = %m, "internal error"),
+            Self::UpstreamFalcon { status, body } => {
+                tracing::warn!(status, body = %body.chars().take(500).collect::<String>(), "falcon error")
+            }
             Self::Anyhow(e) => tracing::error!(error = %e, "anyhow error"),
             _ => {}
         }

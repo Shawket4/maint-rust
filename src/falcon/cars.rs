@@ -30,35 +30,73 @@ pub async fn fetch_cars_cached(
     Ok(v)
 }
 
-/// Project Falcon's cars response into vehicles + drivers arrays.
+/// The only driver fields the maintenance app has a use for. Falcon's driver
+/// object also carries the national ID number, document image names, loans
+/// and expenses; none of that belongs in the garage app, its local database,
+/// this cache or its backups.
+const DRIVER_FIELDS: &[&str] = &[
+    "ID", "id", "name", "mobile_number", "transporter",
+    "id_license_expiration_date", "driver_license_expiration_date",
+    "safety_license_expiration_date", "drug_test_expiration_date", "is_approved",
+];
+
+fn scrub_driver(d: &Value) -> Value {
+    match d.as_object() {
+        Some(o) => Value::Object(
+            o.iter().filter(|(k, _)| DRIVER_FIELDS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ),
+        None => Value::Null,
+    }
+}
+
+/// Falcon dates arrive as "YYYY-MM-DD…" strings. Take the first ten
+/// CHARACTERS: slicing bytes panicked on any non-ASCII value (Arabic-Indic
+/// digits) and took /cache/vehicles down for every client.
+fn parse_date(v: Option<&Value>) -> Option<chrono::NaiveDate> {
+    let s: String = v?.as_str()?.trim().chars().take(10).collect();
+    chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()
+}
+
+/// Falcon numbers as i32, or None when missing or out of range (a wrapped
+/// odometer is worse than no odometer).
+fn int32(v: Option<&Value>) -> Option<i32> {
+    let v = v?;
+    let n = v.as_i64().or_else(|| v.as_f64().filter(|f| f.is_finite()).map(|f| f.round() as i64))?;
+    i32::try_from(n).ok()
+}
+
+fn float(v: Option<&Value>) -> Option<f64> {
+    let v = v?;
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).filter(|f| f.is_finite())
+}
+
+fn row_id(v: &Value) -> Option<i32> {
+    int32(v.get("ID")).or_else(|| int32(v.get("id"))).filter(|id| *id > 0)
+}
+
+/// Project Falcon's cars response into vehicles + drivers arrays, sorted by
+/// id (a stable write order keeps two concurrent refreshes from deadlocking).
 pub fn project_vehicles_and_drivers(raw: &Value) -> (Vec<Value>, Vec<Value>) {
     let arr = match raw.as_array() {
         Some(a) => a.clone(),
-        None => raw
-            .get("data")
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default(),
+        None => raw.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default(),
     };
 
     let mut vehicles = Vec::with_capacity(arr.len());
-    let mut drivers_by_id: std::collections::HashMap<i64, Value> = Default::default();
+    let mut drivers_by_id: std::collections::BTreeMap<i32, Value> = Default::default();
 
     for car in &arr {
-        // Drop nested driver into separate list, deduped by id.
-        if let Some(d) = car.get("driver") {
-            let id = d.get("ID").and_then(|v| v.as_i64()).or_else(|| {
-                d.get("id").and_then(|v| v.as_i64())
-            });
-            if let Some(id) = id {
-                if id != 0 {
-                    drivers_by_id.entry(id).or_insert_with(|| d.clone());
-                }
+        let mut car = car.clone();
+        if let Some(d) = car.get("driver").filter(|d| d.is_object()) {
+            let clean = scrub_driver(d);
+            if let Some(id) = row_id(&clean) {
+                drivers_by_id.entry(id).or_insert_with(|| clean.clone());
             }
+            car["driver"] = clean;
         }
-        // Keep the full car object for the client. The client already handles "driver" inline.
-        vehicles.push(car.clone());
+        vehicles.push(car);
     }
+    vehicles.sort_by_key(|v| row_id(v).unwrap_or(i32::MAX));
 
     let drivers: Vec<Value> = drivers_by_id.into_values().collect();
     (vehicles, drivers)
@@ -79,9 +117,7 @@ pub async fn upsert_cars_into_cache(
     let mut seen_vehicle_ids: Vec<i32> = Vec::with_capacity(vehicles.len());
 
     for v in vehicles {
-        let Some(id) = v.get("ID").and_then(|x| x.as_i64()).map(|x| x as i32).or_else(|| {
-            v.get("id").and_then(|x| x.as_i64()).map(|x| x as i32)
-        }) else {
+        let Some(id) = row_id(v) else {
             continue;
         };
         seen_vehicle_ids.push(id);
@@ -93,40 +129,25 @@ pub async fn upsert_cars_into_cache(
             .to_string();
         let car_type = v.get("car_type").and_then(|x| x.as_str()).map(str::to_string);
         let transporter = v.get("transporter").and_then(|x| x.as_str()).map(str::to_string);
-        let tank_capacity = v.get("tank_capacity").and_then(|x| x.as_i64()).map(|x| x as i32);
+        let tank_capacity = int32(v.get("tank_capacity"));
         let json_compartments = v.get("json_compartments").cloned();
-        let license_expiration_date = v
-            .get("license_expiration_date")
-            .and_then(|x| x.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok());
-        let calibration_expiration_date = v
-            .get("calibration_expiration_date")
-            .and_then(|x| x.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok());
-        let tank_license_expiration_date = v
-            .get("tank_license_expiration_date")
-            .and_then(|x| x.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok());
+        let license_expiration_date = parse_date(v.get("license_expiration_date"));
+        let calibration_expiration_date = parse_date(v.get("calibration_expiration_date"));
+        let tank_license_expiration_date = parse_date(v.get("tank_license_expiration_date"));
         let is_in_trip = v.get("is_in_trip").and_then(|x| x.as_bool()).unwrap_or(false);
         let is_approved = v.get("is_approved").and_then(|x| x.as_bool()).unwrap_or(false);
         let location = v.get("location").and_then(|x| x.as_str()).map(str::to_string);
-        let lat = v.get("lat").and_then(|x| x.as_f64());
-        let long = v.get("long").and_then(|x| x.as_f64());
+        let lat = float(v.get("lat"));
+        let long = float(v.get("long"));
         let location_time_stamp = v
             .get("location_time_stamp")
             .and_then(|x| x.as_str())
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Utc));
         let engine_status = v.get("engine_status").and_then(|x| x.as_str()).map(str::to_string);
-        let speed = v.get("speed").and_then(|x| x.as_i64()).map(|x| x as i32);
-        let last_fuel_odometer = v
-            .get("last_fuel_odometer")
-            .and_then(|x| x.as_i64())
-            .map(|x| x as i32);
-        let last_oil_change_id = v
-            .get("last_oil_change_id")
-            .and_then(|x| x.as_i64())
-            .map(|x| x as i32);
+        let speed = int32(v.get("speed"));
+        let last_fuel_odometer = int32(v.get("last_fuel_odometer"));
+        let last_oil_change_id = int32(v.get("last_oil_change_id"));
         // The mirror stays PURE Falcon data. Odometer overrides participate in
         // arbitration only through v_current_odometer (0014, where downward
         // corrections work via superseded_km) — merging them here was an
@@ -134,11 +155,8 @@ pub async fn upsert_cars_into_cache(
         // contaminated raw_payload.
         // Falcon stores mileage as float64 (oil-change readings can carry a
         // fraction); as_i64 alone turned 123456.5 into NULL.
-        let mileage = v
-            .get("mileage")
-            .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f.round() as i64)))
-            .map(|x| x as i32);
-        let driver_id = v.get("driver_id").and_then(|x| x.as_i64()).map(|x| x as i32);
+        let mileage = int32(v.get("mileage"));
+        let driver_id = int32(v.get("driver_id"));
         let operating_company = v
             .get("operating_company")
             .and_then(|x| x.as_str())
@@ -185,10 +203,11 @@ pub async fn upsert_cars_into_cache(
                 etit_car_id, car_license_url, car_license_back_url,
                 calibration_license_url, calibration_license_back_url,
                 tank_license_url, tank_license_back_url,
-                raw_payload, source_deleted_at, fetched_at
+                raw_payload, source_deleted_at, fetched_at,
+                fuel_odometer_changed_at, mileage_changed_at
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,NULL, now()
+                $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,NULL, now(), now(), now()
             )
             ON CONFLICT (id) DO UPDATE SET
                 car_no_plate = EXCLUDED.car_no_plate,
@@ -225,6 +244,16 @@ pub async fn upsert_cars_into_cache(
                 tank_license_back_url = EXCLUDED.tank_license_back_url,
                 raw_payload = EXCLUDED.raw_payload,
                 source_deleted_at = NULL,
+                -- When each reading last CHANGED. The odometer views compare
+                -- these with the time of a manual correction, and report them
+                -- as "observed" (a parked truck used to look freshly read on
+                -- every poll).
+                fuel_odometer_changed_at = CASE
+                    WHEN vehicles_cache.last_fuel_odometer IS DISTINCT FROM EXCLUDED.last_fuel_odometer
+                    THEN now() ELSE COALESCE(vehicles_cache.fuel_odometer_changed_at, vehicles_cache.fetched_at) END,
+                mileage_changed_at = CASE
+                    WHEN vehicles_cache.mileage IS DISTINCT FROM EXCLUDED.mileage
+                    THEN now() ELSE COALESCE(vehicles_cache.mileage_changed_at, vehicles_cache.fetched_at) END,
                 fetched_at = now()
             "#,
         )
@@ -283,30 +312,16 @@ pub async fn upsert_cars_into_cache(
 
     // Drivers
     for d in drivers {
-        let Some(id) = d.get("ID").and_then(|x| x.as_i64()).map(|x| x as i32).or_else(|| {
-            d.get("id").and_then(|x| x.as_i64()).map(|x| x as i32)
-        }) else {
+        let Some(id) = row_id(d) else {
             continue;
         };
         let name = d.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let mobile_number = d.get("mobile_number").and_then(|x| x.as_str()).map(str::to_string);
         let transporter = d.get("transporter").and_then(|x| x.as_str()).map(str::to_string);
-        let id_license_expiration_date = d
-            .get("id_license_expiration_date")
-            .and_then(|x| x.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok());
-        let driver_license_expiration_date = d
-            .get("driver_license_expiration_date")
-            .and_then(|x| x.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok());
-        let safety_license_expiration_date = d
-            .get("safety_license_expiration_date")
-            .and_then(|x| x.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok());
-        let drug_test_expiration_date = d
-            .get("drug_test_expiration_date")
-            .and_then(|x| x.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok());
+        let id_license_expiration_date = parse_date(d.get("id_license_expiration_date"));
+        let driver_license_expiration_date = parse_date(d.get("driver_license_expiration_date"));
+        let safety_license_expiration_date = parse_date(d.get("safety_license_expiration_date"));
+        let drug_test_expiration_date = parse_date(d.get("drug_test_expiration_date"));
         let is_approved = d.get("is_approved").and_then(|x| x.as_bool()).unwrap_or(false);
 
         sqlx::query(
@@ -346,4 +361,40 @@ pub async fn upsert_cars_into_cache(
 
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dates_never_panic_on_non_ascii() {
+        assert_eq!(parse_date(Some(&json!("2026-03-01T00:00:00Z"))), chrono::NaiveDate::from_ymd_opt(2026, 3, 1));
+        assert_eq!(parse_date(Some(&json!("٢٠٢٦-٠٣-٠١"))), None);
+        assert_eq!(parse_date(Some(&json!("غير محدد"))), None);
+        assert_eq!(parse_date(Some(&json!(""))), None);
+        assert_eq!(parse_date(None), None);
+    }
+
+    #[test]
+    fn numbers_do_not_wrap() {
+        assert_eq!(int32(Some(&json!(123456.5))), Some(123457));
+        assert_eq!(int32(Some(&json!(9_999_999_999i64))), None);
+        assert_eq!(float(Some(&json!("30.0444"))), Some(30.0444));
+    }
+
+    #[test]
+    fn drivers_are_scrubbed_everywhere_and_ordered() {
+        let raw = json!({"data": [
+            {"ID": 9, "car_no_plate": "b", "driver": {"ID": 5, "name": "A", "social_security_number": "2990", "loans": [1]}},
+            {"ID": 2, "car_no_plate": "a", "driver": {"ID": 3, "name": "B", "id_license_image_name": "x.jpg"}},
+        ]});
+        let (vehicles, drivers) = project_vehicles_and_drivers(&raw);
+        assert_eq!(row_id(&vehicles[0]), Some(2));
+        assert_eq!(drivers.iter().map(|d| row_id(d).unwrap()).collect::<Vec<_>>(), vec![3, 5]);
+        let text = serde_json::to_string(&(&vehicles, &drivers)).unwrap();
+        assert!(!text.contains("social_security") && !text.contains("loans") && !text.contains("image_name"));
+        assert!(text.contains("\"name\":\"A\""));
+    }
 }
