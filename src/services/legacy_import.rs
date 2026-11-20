@@ -83,11 +83,40 @@ pub async fn reclassify(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> ApiRe
     Ok(())
 }
 
+/// One person's name and permission, as Falcon just reported them.
+pub async fn remember_user(pool: &PgPool, id: i64, name: &str, permission: i32) -> ApiResult<()> {
+    let name = name.trim();
+    sqlx::query(
+        "INSERT INTO users_cache (id, name, permission, fetched_at) VALUES ($1, NULLIF($2, ''), $3, now())          ON CONFLICT (id) DO UPDATE SET name = COALESCE(EXCLUDED.name, users_cache.name),                permission = EXCLUDED.permission, fetched_at = now()",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(permission)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Names and permissions of every Falcon user, into `users_cache`.
+pub async fn import_users(pool: &PgPool, falcon: &PgPool) -> ApiResult<u64> {
+    let users: Vec<(i64, Option<String>, Option<i64>)> =
+        sqlx::query_as("SELECT id::bigint, name::text, permission::bigint FROM users").fetch_all(falcon).await?;
+    let mut n = 0;
+    for (id, name, permission) in users {
+        remember_user(pool, id, name.as_deref().unwrap_or(""), permission.unwrap_or(0) as i32).await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Import at start-up and every hour, when the Falcon database is configured.
 pub fn spawn_periodic(pool: PgPool, falcon: Option<PgPool>) {
     let Some(falcon) = falcon else { return };
     actix_web::rt::spawn(async move {
         loop {
+            if let Err(e) = import_users(&pool, &falcon).await {
+                tracing::warn!(error = %e, "user names import failed");
+            }
             match import(&pool, &falcon).await {
                 Ok(s) => tracing::info!(lines = s.lines, recognised = s.recognised, unrecognised = s.unrecognised, "legacy service history imported"),
                 Err(e) => tracing::warn!(error = %e, "legacy service history import failed"),
