@@ -16,6 +16,10 @@ use crate::error::{ApiError, ApiResult};
 use crate::handlers::AppState;
 use crate::services::stock_ledger;
 
+/// Falcon's ledger is keyed by text, so two spellings of one product are two
+/// lines there; here each line resolves to its catalog product (a trigger on
+/// the cache) and the lines of one product ADD UP.
+///
 /// Falcon's counts are authoritative, but they do not yet include movements
 /// we recorded and have not managed to push up. on-hand = Falcon's number plus
 /// our pending movements — never just Falcon's number, which silently gave
@@ -36,7 +40,8 @@ async fn refresh_tire_cache(state: &AppState, token: &str) -> bool {
             let qty = row.get("on_hand_qty").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
             sqlx::query(
                 "INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty) VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (brand, model, size) DO UPDATE SET on_hand_qty = EXCLUDED.on_hand_qty, fetched_at = now()",
+                 ON CONFLICT (brand, model, size) DO UPDATE SET \
+                    on_hand_qty = tire_stock_cache.on_hand_qty + EXCLUDED.on_hand_qty, fetched_at = now()",
             )
             .bind(brand).bind(model).bind(size).bind(qty)
             .execute(&mut *tx).await?;
@@ -83,7 +88,8 @@ async fn refresh_oil_cache(state: &AppState, token: &str) -> bool {
             let liters = row.get("liters_on_hand").and_then(|x| x.as_f64()).unwrap_or(0.0);
             sqlx::query(
                 "INSERT INTO oil_stock_cache (oil_type, liters_on_hand) VALUES ($1,$2) \
-                 ON CONFLICT (oil_type) DO UPDATE SET liters_on_hand = EXCLUDED.liters_on_hand, fetched_at = now()",
+                 ON CONFLICT (oil_type) DO UPDATE SET \
+                    liters_on_hand = oil_stock_cache.liters_on_hand + EXCLUDED.liters_on_hand, fetched_at = now()",
             )
             .bind(oil).bind(liters)
             .execute(&mut *tx).await?;
@@ -274,6 +280,155 @@ async fn credit_oil(
         .json(row.map(|r| r.0).unwrap_or_else(|| json!({ "oil_type": oil_type, "liters_on_hand": 0.0 }))))
 }
 
+// ── stock counts ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct TireCount {
+    brand: String,
+    model: Option<String>,
+    size: Option<String>,
+    /// How many are on the shelf.
+    counted: i32,
+    ref_id: Option<String>,
+    note: Option<String>,
+}
+
+/// "We counted N." Records the one movement that brings the book figure to N
+/// (a credit when there are more, a debit when there are fewer), marked as a
+/// count. Counting the same figure twice changes nothing.
+#[post("/stock/tires/count")]
+async fn count_tires(
+    state: web::Data<AppState>,
+    claims: AuthClaims,
+    token: BearerToken,
+    body: web::Json<TireCount>,
+) -> ApiResult<HttpResponse> {
+    claims.require(level::STOCK_CREDIT, "correcting stock")?;
+    let b = body.into_inner();
+    if !(0..=100_000).contains(&b.counted) {
+        return Err(ApiError::BadRequest("counted must be between 0 and 100000".into()));
+    }
+    let brand = clean(Some(&b.brand), "brand")?.ok_or_else(|| ApiError::BadRequest("brand is required".into()))?;
+    let model = clean(b.model.as_deref(), "model")?;
+    let size = clean(b.size.as_deref(), "size")?;
+    let note = clean(b.note.as_deref(), "note")?;
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?.unwrap_or_else(uuid::Uuid::new_v4);
+
+    let mut tx = state.pool.begin().await?;
+    // The product as the catalog spells it, and its line (locked: two counts
+    // at once must not both compute from the same figure).
+    let (product,): (uuid::Uuid,) = sqlx::query_as("SELECT maint_tire_product($1, $2, $3, $4)")
+        .bind(&brand)
+        .bind(&model)
+        .bind(&size)
+        .bind(claims.user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7))").bind(product).execute(&mut *tx).await?;
+    let (pb, pm, ps): (String, String, String) =
+        sqlx::query_as("SELECT brand, model, size FROM tire_products WHERE id = $1").bind(product).fetch_one(&mut *tx).await?;
+    let before: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(on_hand_qty), 0)::bigint FROM tire_stock_cache WHERE tire_product_id = $1")
+        .bind(product)
+        .fetch_one(&mut *tx)
+        .await?;
+    let diff = i64::from(b.counted) - before;
+    if diff != 0 {
+        let recorded = stock_ledger::record(
+            &mut tx,
+            &stock_ledger::Movement {
+                kind: if diff > 0 { "tire_credit" } else { "tire_debit" },
+                brand: Some(pb.clone()),
+                model: Some(pm.clone()).filter(|m| !m.is_empty()),
+                size: Some(ps.clone()).filter(|x| !x.is_empty()),
+                oil_type: None,
+                qty: Some(diff.unsigned_abs() as i32),
+                liters: None,
+                ref_id,
+                work_order_id: None,
+                user_id: Some(claims.user_id),
+                note,
+            },
+        )
+        .await?;
+        if recorded {
+            sqlx::query("UPDATE stock_movements SET is_count = true WHERE ref_id = $1").bind(ref_id).execute(&mut *tx).await?;
+        }
+    }
+    let after: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(on_hand_qty), 0)::bigint FROM tire_stock_cache WHERE tire_product_id = $1")
+        .bind(product)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if diff != 0 {
+        stock_ledger::spawn_mirror(&state, &token.0);
+    }
+    Ok(HttpResponse::Ok().json(json!({ "brand": pb, "model": pm, "size": ps, "before": before, "on_hand_qty": after, "change": after - before })))
+}
+
+#[derive(Debug, Deserialize)]
+struct OilCount {
+    oil_type: String,
+    counted_liters: f64,
+    ref_id: Option<String>,
+    note: Option<String>,
+}
+
+#[post("/stock/oil/count")]
+async fn count_oil(
+    state: web::Data<AppState>,
+    claims: AuthClaims,
+    token: BearerToken,
+    body: web::Json<OilCount>,
+) -> ApiResult<HttpResponse> {
+    claims.require(level::STOCK_CREDIT, "correcting stock")?;
+    let b = body.into_inner();
+    if !b.counted_liters.is_finite() || !(0.0..=1_000_000.0).contains(&b.counted_liters) {
+        return Err(ApiError::BadRequest("counted_liters must be between 0 and 1000000".into()));
+    }
+    let counted = (b.counted_liters * 100.0).round() / 100.0;
+    let oil_type =
+        clean(Some(&b.oil_type), "oil_type")?.ok_or_else(|| ApiError::BadRequest("oil_type is required".into()))?;
+    let note = clean(b.note.as_deref(), "note")?;
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?.unwrap_or_else(uuid::Uuid::new_v4);
+
+    let mut tx = state.pool.begin().await?;
+    let (product,): (uuid::Uuid,) =
+        sqlx::query_as("SELECT maint_oil_product($1, $2)").bind(&oil_type).bind(claims.user_id).fetch_one(&mut *tx).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7))").bind(product).execute(&mut *tx).await?;
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM oil_products WHERE id = $1").bind(product).fetch_one(&mut *tx).await?;
+    let on_hand = "SELECT COALESCE(SUM(liters_on_hand), 0)::float8 FROM oil_stock_cache WHERE oil_product_id = $1";
+    let before: f64 = sqlx::query_scalar(on_hand).bind(product).fetch_one(&mut *tx).await?;
+    let diff = ((counted - before) * 100.0).round() / 100.0;
+    if diff != 0.0 {
+        let recorded = stock_ledger::record(
+            &mut tx,
+            &stock_ledger::Movement {
+                kind: if diff > 0.0 { "oil_credit" } else { "oil_debit" },
+                brand: None,
+                model: None,
+                size: None,
+                oil_type: Some(name.clone()),
+                qty: None,
+                liters: Some(diff.abs()),
+                ref_id,
+                work_order_id: None,
+                user_id: Some(claims.user_id),
+                note,
+            },
+        )
+        .await?;
+        if recorded {
+            sqlx::query("UPDATE stock_movements SET is_count = true WHERE ref_id = $1").bind(ref_id).execute(&mut *tx).await?;
+        }
+    }
+    let after: f64 = sqlx::query_scalar(on_hand).bind(product).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    if diff != 0.0 {
+        stock_ledger::spawn_mirror(&state, &token.0);
+    }
+    Ok(HttpResponse::Ok().json(json!({ "oil_type": name, "before": before, "liters_on_hand": after, "change": ((after - before) * 100.0).round() / 100.0 })))
+}
+
 /// The in/out ledger: every recorded stock movement (debits from oil changes
 /// and shipment-tire mounts, credits from the dashboard), newest first, with
 /// the consuming work order's plate resolved. `kind` filters to tire | oil.
@@ -312,7 +467,8 @@ async fn stock_movements(
              -- (a Cairo-DST session tz would otherwise vary the offset).
              'created_at', to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
              'mirrored', (m.mirrored_to_falcon_at IS NOT NULL),
-             'mirror_error', m.mirror_error, 'user_id', m.user_id, 'note', m.note)
+             'mirror_error', m.mirror_error, 'user_id', m.user_id, 'note', m.note,
+             'is_count', m.is_count, 'user_name', (SELECT u.name FROM users_cache u WHERE u.id = m.user_id))
            FROM stock_movements m
            LEFT JOIN work_orders wo ON wo.id = m.work_order_id
            LEFT JOIN vehicles_cache v ON v.id = wo.vehicle_id
@@ -368,5 +524,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(stock_movements)
         .service(credit_tires)
         .service(credit_oil)
+        .service(count_tires)
+        .service(count_oil)
         .service(dev_seed);
 }

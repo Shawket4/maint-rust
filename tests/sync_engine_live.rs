@@ -1141,7 +1141,9 @@ async fn mounted_tire_km_is_live_with_the_odometer_in_the_view() {
     let (_layout, pos) = seed_chassis(&pool, vid).await;
     sqlx::query(
         "INSERT INTO vehicles_cache (id, car_no_plate, last_fuel_odometer, raw_payload, fetched_at)
-         VALUES ($1, 'PARITY-2', 260000, '{}'::jsonb, now())",
+         VALUES ($1, 'PARITY-2', 260000, '{}'::jsonb, now())
+         ON CONFLICT (id) DO UPDATE SET car_no_plate = EXCLUDED.car_no_plate,
+            last_fuel_odometer = EXCLUDED.last_fuel_odometer, fuel_odometer_changed_at = now()",
     )
     .bind(vid as i32)
     .execute(&pool)
