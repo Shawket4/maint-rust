@@ -16,7 +16,7 @@ async fn service_events(
     let pool = state
         .falcon_pool
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Falcon DB not configured".into()))?;
+        .ok_or_else(|| ApiError::Unavailable("service history is not configured on the server".into()))?;
 
     let rows: Vec<(Value,)> = sqlx::query_as(
         r#"
@@ -30,11 +30,13 @@ async fn service_events(
             'items', COALESCE(
                 (SELECT jsonb_agg(jsonb_build_object('service', ii.service, 'notes', ii.notes)
                         ORDER BY ii.item_order)
-                 FROM inspection_items ii WHERE ii.service_invoice_id = si.id), '[]'::jsonb)
+                 FROM inspection_items ii
+                  WHERE ii.service_invoice_id = si.id AND ii.deleted_at IS NULL), '[]'::jsonb)
         )
         FROM service_invoices si
         WHERE si.car_id = $1 AND si.deleted_at IS NULL
-        ORDER BY si.date DESC
+        ORDER BY si.date DESC, si.id DESC
+        LIMIT 500
         "#,
     )
     .bind(car_id as i64)

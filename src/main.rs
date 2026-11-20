@@ -31,10 +31,12 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init_pool(&cfg.database_url).await?;
 
     // Run migrations on startup. This makes the deploy story painless on a fresh box.
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("running migrations")?;
+    // ignore_missing: a database that is AHEAD of this binary (a newer build
+    // migrated it, then was rolled back) must still boot. Without it the
+    // previous binary refuses to start and a failed deploy cannot roll back.
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(&pool).await.context("running migrations")?;
     tracing::info!("migrations up to date");
 
     // Optional read-only pool to Falcon's Postgres (service history + AI SQL tool).

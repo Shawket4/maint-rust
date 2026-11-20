@@ -26,7 +26,15 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 async fn test_pool() -> Option<PgPool> {
-    let url = std::env::var("MAINT_TEST_DATABASE_URL").ok()?;
+    let Ok(url) = std::env::var("MAINT_TEST_DATABASE_URL") else {
+        // CI sets MAINT_REQUIRE_LIVE_TESTS so a missing database fails loudly
+        // instead of every test passing without running.
+        assert!(
+            std::env::var("MAINT_REQUIRE_LIVE_TESTS").is_err(),
+            "MAINT_REQUIRE_LIVE_TESTS is set but MAINT_TEST_DATABASE_URL is not"
+        );
+        return None;
+    };
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&url)

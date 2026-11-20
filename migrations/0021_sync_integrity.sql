@@ -66,17 +66,29 @@ CREATE INDEX idx_positions_feed ON chassis_positions(updated_at, id);
 
 -- ── 3. constraints ──────────────────────────────────────────────────────────
 -- A deleted chassis must not block its rebuild: uniqueness is for LIVE rows.
-ALTER TABLE chassis_layouts DROP CONSTRAINT chassis_layouts_vehicle_id_key;
+ALTER TABLE chassis_layouts DROP CONSTRAINT IF EXISTS chassis_layouts_vehicle_id_key;
 CREATE UNIQUE INDEX uq_chassis_layouts_vehicle_live
     ON chassis_layouts(vehicle_id) WHERE deleted_at IS NULL;
 
-ALTER TABLE chassis_axles DROP CONSTRAINT chassis_axles_layout_id_section_section_index_key;
+ALTER TABLE chassis_axles DROP CONSTRAINT IF EXISTS chassis_axles_layout_id_section_section_index_key;
 CREATE UNIQUE INDEX uq_chassis_axles_live
     ON chassis_axles(layout_id, section, section_index) WHERE deleted_at IS NULL;
 
-ALTER TABLE chassis_positions DROP CONSTRAINT chassis_positions_layout_id_position_code_key;
+ALTER TABLE chassis_positions DROP CONSTRAINT IF EXISTS chassis_positions_layout_id_position_code_key;
 CREATE UNIQUE INDEX uq_chassis_positions_live
     ON chassis_positions(layout_id, position_code) WHERE deleted_at IS NULL;
+
+-- Bring stored rows in line with the pairings enforced below, so a later
+-- edit of an old row is not refused for something it did not change.
+UPDATE work_orders SET closed_at = updated_at WHERE status = 'closed' AND closed_at IS NULL;
+UPDATE work_orders SET closed_at = NULL       WHERE status = 'open'   AND closed_at IS NOT NULL;
+UPDATE tire_assignments
+   SET dismounted_odometer = NULL, dismount_reason = NULL
+ WHERE dismounted_at IS NULL AND (dismounted_odometer IS NOT NULL OR dismount_reason IS NOT NULL);
+UPDATE tires SET brand = '?' WHERE btrim(brand) = '';
+UPDATE tires SET total_km = LEAST(GREATEST(COALESCE(total_km, 0), 0), 9999999)
+ WHERE total_km IS NULL OR total_km < 0 OR total_km > 9999999;
+UPDATE tires SET retread_count = 0 WHERE retread_count < 0;
 
 -- Sanity bounds. NOT VALID: enforced for every new or changed row without
 -- failing the deploy on a historical typo that is already stored.
@@ -126,8 +138,15 @@ CREATE INDEX idx_sm_unmirrored ON stock_movements(created_at)
 CREATE INDEX idx_sm_created ON stock_movements(created_at DESC, id DESC);
 
 -- The cache keys were nullable inside a UNIQUE — two (brand, NULL, NULL) rows
--- could coexist and a debit matched neither.
-UPDATE tire_stock_cache SET model = COALESCE(model, ''), size = COALESCE(size, '');
+-- could coexist and a debit matched neither. Fold duplicates, then forbid NULL.
+CREATE TEMP TABLE _tire_stock_fold ON COMMIT DROP AS
+    SELECT btrim(brand) AS brand, COALESCE(btrim(model), '') AS model, COALESCE(btrim(size), '') AS size,
+           SUM(on_hand_qty)::int AS on_hand_qty, MAX(fetched_at) AS fetched_at
+      FROM tire_stock_cache
+     GROUP BY 1, 2, 3;
+DELETE FROM tire_stock_cache;
+INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty, fetched_at)
+    SELECT brand, model, size, on_hand_qty, fetched_at FROM _tire_stock_fold WHERE brand <> '';
 ALTER TABLE tire_stock_cache
     ALTER COLUMN model SET DEFAULT '', ALTER COLUMN model SET NOT NULL,
     ALTER COLUMN size  SET DEFAULT '', ALTER COLUMN size  SET NOT NULL;

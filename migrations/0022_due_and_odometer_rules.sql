@@ -19,14 +19,14 @@
 -- 4. A mileage-only plan on a vehicle with no odometer reading reported 'ok'.
 --    It is 'unknown' now — nothing can be said about it.
 
-ALTER TABLE service_plans DROP CONSTRAINT service_plans_check;
+ALTER TABLE service_plans DROP CONSTRAINT IF EXISTS service_plans_check;
 ALTER TABLE service_plans
     ADD CONSTRAINT ck_plan_intervals CHECK (
         (interval_km IS NOT NULL OR interval_days IS NOT NULL)
         AND (interval_km   IS NULL OR interval_km   > 0)
         AND (interval_days IS NULL OR interval_days > 0)
         AND lead_warn_km >= 0 AND lead_warn_days >= 0
-    );
+    ) NOT VALID;
 
 CREATE OR REPLACE VIEW v_current_odometer AS
 WITH ov AS (
