@@ -16,6 +16,10 @@ use crate::error::{ApiError, ApiResult};
 use crate::handlers::AppState;
 use crate::services::stock_ledger;
 
+/// Falcon's ledger is keyed by text, so two spellings of one product are two
+/// lines there; here each line resolves to its catalog product (a trigger on
+/// the cache) and the lines of one product ADD UP.
+///
 /// Falcon's counts are authoritative, but they do not yet include movements
 /// we recorded and have not managed to push up. on-hand = Falcon's number plus
 /// our pending movements — never just Falcon's number, which silently gave
@@ -36,7 +40,8 @@ async fn refresh_tire_cache(state: &AppState, token: &str) -> bool {
             let qty = row.get("on_hand_qty").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
             sqlx::query(
                 "INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty) VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (brand, model, size) DO UPDATE SET on_hand_qty = EXCLUDED.on_hand_qty, fetched_at = now()",
+                 ON CONFLICT (brand, model, size) DO UPDATE SET \
+                    on_hand_qty = tire_stock_cache.on_hand_qty + EXCLUDED.on_hand_qty, fetched_at = now()",
             )
             .bind(brand).bind(model).bind(size).bind(qty)
             .execute(&mut *tx).await?;
@@ -83,7 +88,8 @@ async fn refresh_oil_cache(state: &AppState, token: &str) -> bool {
             let liters = row.get("liters_on_hand").and_then(|x| x.as_f64()).unwrap_or(0.0);
             sqlx::query(
                 "INSERT INTO oil_stock_cache (oil_type, liters_on_hand) VALUES ($1,$2) \
-                 ON CONFLICT (oil_type) DO UPDATE SET liters_on_hand = EXCLUDED.liters_on_hand, fetched_at = now()",
+                 ON CONFLICT (oil_type) DO UPDATE SET \
+                    liters_on_hand = oil_stock_cache.liters_on_hand + EXCLUDED.liters_on_hand, fetched_at = now()",
             )
             .bind(oil).bind(liters)
             .execute(&mut *tx).await?;
