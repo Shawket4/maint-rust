@@ -19,7 +19,7 @@ pub struct ImportSummary {
     pub removed: i64,
 }
 
-type FalconLine = (i64, i64, i64, String, chrono::DateTime<chrono::Utc>, Option<i64>);
+pub type FalconLine = (i64, i64, i64, String, chrono::DateTime<chrono::Utc>, Option<i64>);
 
 pub async fn import(pool: &PgPool, falcon: &PgPool) -> ApiResult<ImportSummary> {
     let lines: Vec<FalconLine> = sqlx::query_as(
@@ -31,7 +31,86 @@ pub async fn import(pool: &PgPool, falcon: &PgPool) -> ApiResult<ImportSummary> 
     )
     .fetch_all(falcon)
     .await?;
+    store(pool, lines).await
+}
 
+/// The same import through Falcon's own API (`GET /api/service-invoices`, in
+/// the caller's name), for a server that has no direct line to Falcon's
+/// database.
+pub async fn import_via_api(pool: &PgPool, falcon: &crate::falcon::FalconClient, token: &str) -> ApiResult<ImportSummary> {
+    let v = falcon.get_json(crate::falcon::invoices::FALCON_INVOICES_PATH, token).await?;
+    let invoices = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| crate::error::ApiError::Unavailable("Falcon did not answer with a list of invoices".into()))?;
+    store(pool, lines_from_api(invoices)).await
+}
+
+/// Falcon's JSON → lines. gorm's own fields are capitalised (`ID`, `DeletedAt`).
+pub fn lines_from_api(invoices: &[serde_json::Value]) -> Vec<FalconLine> {
+    let mut out = Vec::new();
+    for inv in invoices {
+        if !inv.get("DeletedAt").map(|d| d.is_null()).unwrap_or(true) {
+            continue;
+        }
+        let (Some(invoice), Some(car)) = (inv.get("ID").and_then(|x| x.as_i64()), inv.get("car_id").and_then(|x| x.as_i64())) else {
+            continue;
+        };
+        let Some(date) = inv
+            .get("date")
+            .and_then(|d| d.as_str())
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.with_timezone(&chrono::Utc))
+        else {
+            continue;
+        };
+        if car <= 0 {
+            continue;
+        }
+        let km = inv.get("meter_reading").and_then(|x| x.as_i64());
+        for item in inv.get("inspection_items").and_then(|i| i.as_array()).map(Vec::as_slice).unwrap_or(&[]) {
+            if !item.get("DeletedAt").map(|d| d.is_null()).unwrap_or(true) {
+                continue;
+            }
+            let (Some(id), Some(service)) = (item.get("ID").and_then(|x| x.as_i64()), item.get("service").and_then(|x| x.as_str())) else {
+                continue;
+            };
+            if service.trim().is_empty() {
+                continue;
+            }
+            out.push((id, invoice, car, service.to_string(), date, km));
+        }
+    }
+    out
+}
+
+/// Without the database link, read the invoices through the API at most once
+/// an hour, on the back of a signed-in request. Returns at once.
+pub fn refresh_via_api_if_stale(state: &crate::handlers::AppState, token: &str) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    if state.falcon_pool.is_some() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST.load(Ordering::Relaxed);
+    if now - last < 3600 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let (pool, falcon, token) = (state.pool.clone(), state.falcon.clone(), token.to_string());
+    actix_web::rt::spawn(async move {
+        match import_via_api(&pool, &falcon, &token).await {
+            Ok(s) => tracing::info!(lines = s.lines, recognised = s.recognised, "legacy service history imported through the API"),
+            Err(e) => {
+                // Let the next request try again rather than wait an hour.
+                LAST.store(0, Ordering::Relaxed);
+                tracing::warn!(error = %e, "legacy service history import through the API failed");
+            }
+        }
+    });
+}
+
+async fn store(pool: &PgPool, lines: Vec<FalconLine>) -> ApiResult<ImportSummary> {
     let mut tx = pool.begin().await?;
     let ids: Vec<i64> = lines.iter().map(|l| l.0).collect();
     for (item, invoice, car, service, date, km) in &lines {
@@ -124,4 +203,30 @@ pub fn spawn_periodic(pool: PgPool, falcon: Option<PgPool>) {
             actix_web::rt::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn falcon_json_becomes_lines() {
+        let invoices = vec![
+            json!({"ID": 10, "DeletedAt": null, "car_id": 4, "date": "2026-03-01T00:00:00+02:00", "meter_reading": 120000,
+                   "inspection_items": [
+                       {"ID": 100, "DeletedAt": null, "service": "تغيير زيت موتور"},
+                       {"ID": 101, "DeletedAt": "2026-03-02T00:00:00Z", "service": "اتمسح"},
+                       {"ID": 102, "DeletedAt": null, "service": "   "}]}),
+            json!({"ID": 11, "DeletedAt": "2026-04-01T00:00:00Z", "car_id": 4, "date": "2026-03-01T00:00:00Z",
+                   "inspection_items": [{"ID": 103, "service": "فرامل"}]}),
+            json!({"ID": 12, "car_id": 0, "date": "2026-03-01T00:00:00Z", "inspection_items": [{"ID": 104, "service": "فرامل"}]}),
+            json!({"ID": 13, "car_id": 5, "date": "not a date", "inspection_items": [{"ID": 105, "service": "فرامل"}]}),
+            json!({"ID": 14, "car_id": 5, "date": "2026-05-01T10:00:00Z"}),
+        ];
+        let lines = lines_from_api(&invoices);
+        assert_eq!(lines.len(), 1, "deleted, blank, car-less and undated rows are left out");
+        assert_eq!((lines[0].0, lines[0].1, lines[0].2, lines[0].5), (100, 10, 4, Some(120000)));
+        assert_eq!(lines[0].4.to_rfc3339(), "2026-02-28T22:00:00+00:00");
+    }
 }

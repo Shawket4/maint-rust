@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::auth::claims::level;
+use crate::auth::middleware::BearerToken;
 use crate::auth::AuthClaims;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
@@ -269,7 +270,8 @@ async fn list_tires(pool: web::Data<PgPool>, q: web::Query<TireListQuery>) -> Ap
 /// Recognised old invoice lines, for the garage app's due clock (it mirrors
 /// them and counts them next to ticked tasks).
 #[get("/legacy-events")]
-async fn legacy_events(pool: web::Data<PgPool>) -> ApiResult<HttpResponse> {
+async fn legacy_events(pool: web::Data<PgPool>, state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
+    legacy_import::refresh_via_api_if_stale(&state, &token.0);
     let (rows,): (Value,) = sqlx::query_as(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
                     'id', l.falcon_item_id, 'vehicle_id', l.vehicle_id, 'category_id', l.category_id,
@@ -283,7 +285,8 @@ async fn legacy_events(pool: web::Data<PgPool>) -> ApiResult<HttpResponse> {
 
 /// Old invoice wording nobody has recognised yet, most common first.
 #[get("/office/legacy/unmatched")]
-async fn legacy_unmatched(pool: web::Data<PgPool>) -> ApiResult<HttpResponse> {
+async fn legacy_unmatched(pool: web::Data<PgPool>, state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
+    legacy_import::refresh_via_api_if_stale(&state, &token.0);
     let (rows,): (Value,) = sqlx::query_as(
         "SELECT COALESCE(jsonb_agg(r.row), '[]'::jsonb) FROM (
             SELECT jsonb_build_object('norm_text', l.norm_text, 'text', MIN(l.service),
@@ -351,13 +354,14 @@ async fn legacy_decide(pool: web::Data<PgPool>, claims: AuthClaims, body: web::J
 
 /// Read Falcon's service invoices again now (it also runs hourly).
 #[post("/office/legacy/import")]
-async fn legacy_import_now(state: web::Data<AppState>, claims: AuthClaims) -> ApiResult<HttpResponse> {
+async fn legacy_import_now(state: web::Data<AppState>, claims: AuthClaims, token: BearerToken) -> ApiResult<HttpResponse> {
     claims.require(level::CONFIGURE, "importing old service lines")?;
-    let falcon = state
-        .falcon_pool
-        .as_ref()
-        .ok_or_else(|| ApiError::Unavailable("service history is not configured on the server".into()))?;
-    Ok(HttpResponse::Ok().json(legacy_import::import(&state.pool, falcon).await?))
+    let summary = match state.falcon_pool.as_ref() {
+        Some(falcon) => legacy_import::import(&state.pool, falcon).await?,
+        // No database link: ask Falcon's API in the caller's name.
+        None => legacy_import::import_via_api(&state.pool, &state.falcon, &token.0).await?,
+    };
+    Ok(HttpResponse::Ok().json(summary))
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
