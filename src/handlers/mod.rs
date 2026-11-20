@@ -6,6 +6,7 @@ pub mod cache_vehicles;
 pub mod catalog;
 pub mod due;
 pub mod health;
+pub mod office;
 pub mod plans;
 pub mod reference;
 pub mod service;
@@ -64,6 +65,7 @@ pub fn api_scope(jwt_secret: String) -> impl HttpServiceFactory {
                 .configure(cache_invoices::configure)
                 .configure(reference::configure)
                 .configure(catalog::configure)
+                .configure(office::configure)
                 .configure(due::configure)
                 .configure(plans::configure)
                 .configure(stock::configure)

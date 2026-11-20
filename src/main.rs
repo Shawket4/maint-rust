@@ -74,6 +74,10 @@ async fn main() -> anyhow::Result<()> {
         ai_limiter: Default::default(),
     };
 
+    // Old Falcon service invoices → maintenance history (no-op without the
+    // read-only Falcon database).
+    maint_rust::services::legacy_import::spawn_periodic(app_state.pool.clone(), app_state.falcon_pool.clone());
+
     let bind = (cfg.bind_addr.clone(), cfg.port);
     let jwt_secret = cfg.jwt_secret.clone();
 
