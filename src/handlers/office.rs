@@ -21,6 +21,11 @@ const WO_ROW: &str = "jsonb_build_object(
     'id', w.id, 'vehicle_id', w.vehicle_id, 'plate', v.car_no_plate,
     'status', w.status::text, 'title', w.title, 'notes', w.notes_ar,
     'opened_at', w.opened_at, 'closed_at', w.closed_at, 'odometer', w.odometer_at_open,
+    'opened_by', (SELECT u.name FROM users_cache u WHERE u.id = w.created_by_user_id),
+    'summary_en', (SELECT string_agg(COALESCE(NULLIF(btrim(t.description_en), ''), j.name_en, c.name_en, NULLIF(btrim(t.description_ar), '')), ', ' ORDER BY t.sort_order)
+                  FROM work_order_tasks t LEFT JOIN maintenance_categories c ON c.id = t.category_id
+                  LEFT JOIN standard_jobs j ON j.id = t.standard_job_id
+                 WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind <> 'oil'),
     'task_count', (SELECT COUNT(*) FROM work_order_tasks t WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind <> 'oil'),
     'done_count', (SELECT COUNT(*) FROM work_order_tasks t WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind <> 'oil' AND t.is_done),
     'oil_liters', (SELECT SUM(o.liters)::float8 FROM oil_changes o WHERE o.work_order_id = w.id AND o.deleted_at IS NULL),
@@ -74,6 +79,22 @@ async fn list_work_orders(pool: web::Data<PgPool>, q: web::Query<WoListQuery>) -
                   ORDER BY (w.status = 'open') DESC, w.opened_at DESC, w.id
                   LIMIT $6 OFFSET $7) r"
     );
+    let counts_sql = format!(
+        "SELECT COALESCE(jsonb_object_agg(s.status, s.n), '{{}}'::jsonb) FROM (
+            SELECT w.status::text AS status, COUNT(*) AS n
+              FROM work_orders w LEFT JOIN vehicles_cache v ON v.id = w.vehicle_id
+             WHERE {} GROUP BY 1) s",
+        filter.replace("$1::text IS NULL OR w.status::text = $1", "$1::text IS NULL OR TRUE")
+    );
+    let term = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (status_counts,): (Value,) = sqlx::query_as(&counts_sql)
+        .bind(status)
+        .bind(q.vehicle_id)
+        .bind(term)
+        .bind(from)
+        .bind(to)
+        .fetch_one(pool.get_ref())
+        .await?;
     let (rows, total): (Value, i64) = sqlx::query_as(&sql)
         .bind(status)
         .bind(q.vehicle_id)
@@ -84,7 +105,7 @@ async fn list_work_orders(pool: web::Data<PgPool>, q: web::Query<WoListQuery>) -
         .bind(offset)
         .fetch_one(pool.get_ref())
         .await?;
-    Ok(HttpResponse::Ok().json(json!({ "rows": rows, "total": total, "limit": limit, "offset": offset })))
+    Ok(HttpResponse::Ok().json(json!({ "rows": rows, "total": total, "limit": limit, "offset": offset, "status_counts": status_counts })))
 }
 
 /// One work order with everything done under it, in display form.
@@ -101,10 +122,14 @@ async fn get_work_order(pool: web::Data<PgPool>, path: web::Path<Uuid>) -> ApiRe
     };
     let (tasks,): (Value,) = sqlx::query_as(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
-                    'id', t.id, 'description', t.description_ar, 'category_id', t.category_id,
+                    'id', t.id, 'description', t.description_ar,
+                    'description_en', COALESCE(NULLIF(btrim(t.description_en), ''), j.name_en),
+                    'done_by', (SELECT u.name FROM users_cache u WHERE u.id = t.updated_by_user_id AND t.is_done),
+                    'category_id', t.category_id,
                     'category_ar', c.name_ar, 'category_en', c.name_en,
                     'is_done', t.is_done, 'done_at', t.done_at) ORDER BY t.sort_order, t.created_at), '[]'::jsonb)
            FROM work_order_tasks t LEFT JOIN maintenance_categories c ON c.id = t.category_id
+           LEFT JOIN standard_jobs j ON j.id = t.standard_job_id
           WHERE t.work_order_id = $1 AND t.deleted_at IS NULL AND t.kind <> 'oil'",
     )
     .bind(id)

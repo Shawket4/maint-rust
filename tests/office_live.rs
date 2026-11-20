@@ -336,3 +336,103 @@ async fn the_office_reads_work_orders_and_a_trucks_maintenance() {
     let tires: Value = test::call_and_read_body_json(&app, get("/api/maint/office/tires?limit=5".into(), "admin_user")).await;
     assert!(tires["rows"].is_array() && tires["status_counts"].is_object());
 }
+
+#[actix_web::test]
+async fn a_stock_count_brings_the_book_to_the_shelf_and_names_who_did_it() {
+    let Some((pool, _)) = test_pool().await else { return };
+    let app = app!(pool);
+    let brand = format!("Count{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let post = |uri: &str, perm: i32, body: Value| {
+        test::TestRequest::post().uri(&format!("/api/maint{uri}")).insert_header(bearer(perm, "admin_user")).set_json(body).to_request()
+    };
+    maint_rust::services::legacy_import::remember_user(&pool, 7, "Mona", 4).await.unwrap();
+
+    // Ten arrive; the shelf has eight.
+    let r = test::call_service(&app, post("/stock/tires/credit", 4, json!({"brand": brand, "model": "M", "size": "S", "qty": 10}))).await;
+    assert!(r.status().is_success());
+    let count = |counted: i32, ref_id: Uuid| post("/stock/tires/count", 4, json!({"brand": format!(" {} ", brand.to_lowercase()), "model": "m", "size": "s", "counted": counted, "ref_id": ref_id}));
+    assert_eq!(test::call_service(&app, post("/stock/tires/count", 3, json!({"brand": brand, "counted": 1}))).await.status(), 403);
+    let ref1 = Uuid::new_v4();
+    let v: Value = test::call_and_read_body_json(&app, count(8, ref1)).await;
+    assert_eq!((v["before"].as_i64(), v["on_hand_qty"].as_i64(), v["change"].as_i64()), (Some(10), Some(8), Some(-2)), "{v}");
+    assert_eq!(v["brand"], brand.as_str(), "found under any spelling, answered in the catalog's");
+    // The same request again (a retry) and the same figure again change nothing.
+    let v: Value = test::call_and_read_body_json(&app, count(8, ref1)).await;
+    assert_eq!(v["change"], 0);
+    let v: Value = test::call_and_read_body_json(&app, count(8, Uuid::new_v4())).await;
+    assert_eq!(v["change"], 0);
+    // More on the shelf than in the book.
+    let v: Value = test::call_and_read_body_json(&app, count(11, Uuid::new_v4())).await;
+    assert_eq!((v["on_hand_qty"].as_i64(), v["change"].as_i64()), (Some(11), Some(3)));
+    assert_eq!(test::call_service(&app, count(-1, Uuid::new_v4())).await.status(), 400);
+
+    let moves: Vec<(String, i32, bool, Option<String>)> = sqlx::query_as(
+        "SELECT m.kind::text, m.qty, m.is_count, u.name FROM stock_movements m LEFT JOIN users_cache u ON u.id = m.user_id \
+          WHERE m.brand = $1 ORDER BY m.created_at, m.id",
+    )
+    .bind(&brand)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        moves,
+        vec![
+            ("tire_credit".into(), 10, false, Some("Mona".into())),
+            ("tire_debit".into(), 2, true, Some("Mona".into())),
+            ("tire_credit".into(), 3, true, Some("Mona".into())),
+        ]
+    );
+
+    // Oil, with decimals.
+    let oil = format!("Oil{}", &brand[5..]);
+    test::call_service(&app, post("/stock/oil/credit", 4, json!({"oil_type": oil, "liters": 200.0}))).await;
+    let v: Value = test::call_and_read_body_json(&app, post("/stock/oil/count", 4, json!({"oil_type": oil, "counted_liters": 187.5}))).await;
+    assert_eq!((v["before"].as_f64(), v["liters_on_hand"].as_f64(), v["change"].as_f64()), (Some(200.0), Some(187.5), Some(-12.5)), "{v}");
+}
+
+#[actix_web::test]
+async fn work_orders_say_who_opened_them_and_how_many_of_each_status() {
+    let Some((pool, _)) = test_pool().await else { return };
+    let car = fresh_vehicle();
+    seed_vehicle(&pool, car).await;
+    let who = 2_000_000 + i64::from(car);
+    let wo = Uuid::new_v4();
+    // The id is new to the mirror: the write goes through and gets a placeholder.
+    sqlx::query("INSERT INTO work_orders (id, vehicle_id, status, created_by_user_id, updated_by_user_id) VALUES ($1, $2, 'open', $3, $3)")
+        .bind(wo)
+        .bind(car)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let job: Uuid = sqlx::query_scalar("INSERT INTO standard_jobs (name_ar, name_en, norm_key) VALUES ($1, 'Weld exhaust', maint_norm($1)) RETURNING id")
+        .bind(format!("لحام شكمان {car}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO work_order_tasks (work_order_id, kind, description_ar, standard_job_id, created_by_user_id, updated_by_user_id) VALUES ($1, 'free', $2, $3, $4, $4)")
+        .bind(wo)
+        .bind(format!("لحام شكمان {car}"))
+        .bind(job)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = app!(pool);
+    let get = |uri: String| test::TestRequest::get().uri(&uri).insert_header(bearer(1, "admin_user")).to_request();
+    let list: Value = test::call_and_read_body_json(&app, get(format!("/api/maint/office/work-orders?vehicle_id={car}&status=closed"))).await;
+    assert_eq!(list["total"], 0);
+    assert_eq!(list["status_counts"], json!({"open": 1}), "counts ignore the status filter itself");
+    let list: Value = test::call_and_read_body_json(&app, get(format!("/api/maint/office/work-orders?vehicle_id={car}"))).await;
+    assert!(list["rows"][0]["opened_by"].is_null(), "not known yet");
+    assert_eq!(list["rows"][0]["summary_en"], "Weld exhaust");
+
+    maint_rust::services::legacy_import::remember_user(&pool, who, " Hany ", 1).await.unwrap();
+    let one: Value = test::call_and_read_body_json(&app, get(format!("/api/maint/office/work-orders/{wo}"))).await;
+    assert_eq!(one["work_order"]["opened_by"], "Hany");
+    assert_eq!(one["tasks"][0]["description_en"], "Weld exhaust");
+    // A later refresh with no name keeps the one we have.
+    maint_rust::services::legacy_import::remember_user(&pool, who, "", 1).await.unwrap();
+    let one: Value = test::call_and_read_body_json(&app, get(format!("/api/maint/office/work-orders/{wo}"))).await;
+    assert_eq!(one["work_order"]["opened_by"], "Hany");
+}
