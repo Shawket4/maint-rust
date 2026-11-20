@@ -203,10 +203,11 @@ pub async fn upsert_cars_into_cache(
                 etit_car_id, car_license_url, car_license_back_url,
                 calibration_license_url, calibration_license_back_url,
                 tank_license_url, tank_license_back_url,
-                raw_payload, source_deleted_at, fetched_at
+                raw_payload, source_deleted_at, fetched_at,
+                fuel_odometer_changed_at, mileage_changed_at
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,NULL, now()
+                $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,NULL, now(), now(), now()
             )
             ON CONFLICT (id) DO UPDATE SET
                 car_no_plate = EXCLUDED.car_no_plate,
@@ -243,13 +244,17 @@ pub async fn upsert_cars_into_cache(
                 tank_license_back_url = EXCLUDED.tank_license_back_url,
                 raw_payload = EXCLUDED.raw_payload,
                 source_deleted_at = NULL,
-                -- fetched_at is what the odometer views report as "observed":
-                -- it moves when a reading changes, not on every poll (a parked
-                -- truck used to look freshly read every few minutes).
-                fetched_at = CASE
-                    WHEN (vehicles_cache.last_fuel_odometer, vehicles_cache.mileage)
-                         IS DISTINCT FROM (EXCLUDED.last_fuel_odometer, EXCLUDED.mileage)
-                    THEN now() ELSE vehicles_cache.fetched_at END
+                -- When each reading last CHANGED. The odometer views compare
+                -- these with the time of a manual correction, and report them
+                -- as "observed" (a parked truck used to look freshly read on
+                -- every poll).
+                fuel_odometer_changed_at = CASE
+                    WHEN vehicles_cache.last_fuel_odometer IS DISTINCT FROM EXCLUDED.last_fuel_odometer
+                    THEN now() ELSE COALESCE(vehicles_cache.fuel_odometer_changed_at, vehicles_cache.fetched_at) END,
+                mileage_changed_at = CASE
+                    WHEN vehicles_cache.mileage IS DISTINCT FROM EXCLUDED.mileage
+                    THEN now() ELSE COALESCE(vehicles_cache.mileage_changed_at, vehicles_cache.fetched_at) END,
+                fetched_at = now()
             "#,
         )
         .bind(id)

@@ -1049,7 +1049,7 @@ async fn override_corrects_downward_and_later_readings_resume_in_the_view() {
     );
 
     // The truck genuinely drives past the corrected number → fuel re-engages.
-    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 510000 WHERE id = $1")
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 510000, fuel_odometer_changed_at = clock_timestamp() WHERE id = $1")
         .bind(vid as i32)
         .execute(&pool)
         .await
@@ -1057,11 +1057,11 @@ async fn override_corrects_downward_and_later_readings_resume_in_the_view() {
     assert_eq!(
         odo(&pool, vid).await,
         (510_000, "falcon_fuel".into()),
-        "a reading past superseded_km resumes normal arbitration"
+        "a reading that changes after the correction resumes normal arbitration"
     );
 
     // Zero fuel readings are sensor artifacts, never the truth (0017).
-    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 0 WHERE id = $1")
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 0, fuel_odometer_changed_at = clock_timestamp() WHERE id = $1")
         .bind(vid as i32)
         .execute(&pool)
         .await
@@ -1101,7 +1101,7 @@ async fn falcon_mileage_counts_as_a_reading_in_the_view() {
     assert_eq!(odo(&pool, vid).await, (204_500, "falcon_mileage".into()));
 
     // An equal fuel reading names the source more precisely.
-    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 204500 WHERE id = $1")
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 204500, fuel_odometer_changed_at = clock_timestamp() WHERE id = $1")
         .bind(vid as i32)
         .execute(&pool)
         .await
@@ -1120,7 +1120,7 @@ async fn falcon_mileage_counts_as_a_reading_in_the_view() {
     .unwrap();
     assert_eq!(odo(&pool, vid).await, (150_000, "manual_override".into()));
 
-    sqlx::query("UPDATE vehicles_cache SET mileage = 205000 WHERE id = $1")
+    sqlx::query("UPDATE vehicles_cache SET mileage = 205000, mileage_changed_at = clock_timestamp() WHERE id = $1")
         .bind(vid as i32)
         .execute(&pool)
         .await
@@ -1128,7 +1128,7 @@ async fn falcon_mileage_counts_as_a_reading_in_the_view() {
     assert_eq!(
         odo(&pool, vid).await,
         (205_000, "falcon_mileage".into()),
-        "mileage past superseded_km re-engages"
+        "mileage that changes after the correction re-engages"
     );
 }
 
@@ -1184,7 +1184,7 @@ async fn mounted_tire_km_is_live_with_the_odometer_in_the_view() {
     assert_eq!(km, 70_000, "base 10k + live run (260k − 200k) — live with the odometer");
 
     // The odometer moves → the derived km moves with it, nothing re-baked.
-    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 275000 WHERE id = $1")
+    sqlx::query("UPDATE vehicles_cache SET last_fuel_odometer = 275000, fuel_odometer_changed_at = clock_timestamp() WHERE id = $1")
         .bind(vid as i32)
         .execute(&pool)
         .await

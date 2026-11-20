@@ -546,8 +546,17 @@ async fn the_odometer_moves_again_after_a_downward_correction() {
         let pool = pool.clone();
         async move {
             sqlx::query(
-                "INSERT INTO vehicles_cache (id, car_no_plate, last_fuel_odometer, mileage, raw_payload) VALUES ($1, 'ODO', $2, $3, '{}'::jsonb)
-                 ON CONFLICT (id) DO UPDATE SET last_fuel_odometer = $2, mileage = $3",
+                // What the fleet refresh does: each reading's change time
+                // moves only when that reading changes.
+                "INSERT INTO vehicles_cache (id, car_no_plate, last_fuel_odometer, mileage, raw_payload,
+                                             fuel_odometer_changed_at, mileage_changed_at)
+                 VALUES ($1, 'ODO', $2, $3, '{}'::jsonb, clock_timestamp(), clock_timestamp())
+                 ON CONFLICT (id) DO UPDATE SET
+                   fuel_odometer_changed_at = CASE WHEN vehicles_cache.last_fuel_odometer IS DISTINCT FROM $2
+                        THEN clock_timestamp() ELSE vehicles_cache.fuel_odometer_changed_at END,
+                   mileage_changed_at = CASE WHEN vehicles_cache.mileage IS DISTINCT FROM $3
+                        THEN clock_timestamp() ELSE vehicles_cache.mileage_changed_at END,
+                   last_fuel_odometer = $2, mileage = $3",
             )
             .bind(vid as i32).bind(fuel).bind(mileage).execute(&pool).await.unwrap();
         }
@@ -559,14 +568,19 @@ async fn the_odometer_moves_again_after_a_downward_correction() {
                 .bind(vid as i32).fetch_one(&pool).await.unwrap()
         }
     };
-    // Falcon holds a typo; the garage corrects it downward.
-    set(4_123_000, 4_123_000).await;
+    // Falcon holds a typo in its mileage (and an older, smaller fuel reading
+    // that is also above the truth); the garage corrects downward.
+    set(430_000, 4_123_000).await;
     push(&pool, vec![ins(EntityType::VehicleOdometerOverrides, vid, json!({"vehicle_id": vid, "odometer": 412_300, "superseded_km": 4_123_000}))]).await;
     assert_eq!(current().await, (412_300, "manual_override".to_string()));
     // The truck refuels: a real, higher reading. It used to be ignored
     // because it was still below the typo.
     set(418_000, 4_123_000).await;
-    assert_eq!(current().await.0, 418_000, "the new fuel reading counts; the stale aggregate does not");
+    assert_eq!(
+        current().await,
+        (418_000, "falcon_fuel".to_string()),
+        "the new fuel reading counts; the stale typo'd mileage still does not"
+    );
 }
 
 #[tokio::test]

@@ -4,9 +4,15 @@
 -- 1. Odometer override: a Falcon reading used to be ignored while it was
 --    <= superseded_km (the Falcon value at the moment of correction). After
 --    correcting a typo'd 4,123,000 down to 412,300, a genuine 418,000 fuel
---    reading was ignored indefinitely — the odometer froze. The rule now
---    ignores only the exact reading that was corrected: a Falcon value counts
---    again as soon as it CHANGES.
+--    reading was ignored indefinitely — the odometer froze. And superseded_km
+--    holds ONE number while Falcon has two readings (fuel and mileage), so
+--    the smaller stale one could still win over the correction.
+--    New rule, the same one oil-change and work-order readings already
+--    follow: a Falcon reading counts only when it was observed AFTER the
+--    correction. Each of the two readings gets its own "last changed" time
+--    (fuel_odometer_changed_at, mileage_changed_at, kept by falcon/cars.rs),
+--    so a stale value stays ignored and the first new reading counts
+--    whatever its size.
 --
 -- 2. Due baseline: "last done" is when the task was ticked (done_at), not the
 --    day its work order was opened. The km baseline is the newest done record
@@ -28,6 +34,24 @@ ALTER TABLE service_plans
         AND lead_warn_km >= 0 AND lead_warn_days >= 0
     ) NOT VALID;
 
+ALTER TABLE vehicles_cache
+    ADD COLUMN fuel_odometer_changed_at TIMESTAMPTZ,
+    ADD COLUMN mileage_changed_at       TIMESTAMPTZ;
+-- Unknown history: assume each reading is as old as the last poll, except on
+-- a corrected vehicle whose reading is still at or below the value that was
+-- corrected — date that one before the correction so it stays ignored.
+UPDATE vehicles_cache SET fuel_odometer_changed_at = fetched_at, mileage_changed_at = fetched_at;
+UPDATE vehicles_cache vc
+   SET fuel_odometer_changed_at = o.set_at - interval '1 second'
+  FROM vehicle_odometer_overrides o
+ WHERE o.vehicle_id = vc.id AND vc.fuel_odometer_changed_at > o.set_at
+   AND COALESCE(vc.last_fuel_odometer, 0) <= COALESCE(o.superseded_km, 2147483647);
+UPDATE vehicles_cache vc
+   SET mileage_changed_at = o.set_at - interval '1 second'
+  FROM vehicle_odometer_overrides o
+ WHERE o.vehicle_id = vc.id AND vc.mileage_changed_at > o.set_at
+   AND COALESCE(vc.mileage, 0) <= COALESCE(o.superseded_km, 2147483647);
+
 CREATE OR REPLACE VIEW v_current_odometer AS
 WITH ov AS (
     SELECT vehicle_id, odometer, set_at, superseded_km
@@ -36,21 +60,19 @@ WITH ov AS (
 ),
 readings AS (
     SELECT vc.id AS vehicle_id, vc.last_fuel_odometer AS km,
-           'falcon_fuel'::text AS src, vc.fetched_at AS observed_at
+           'falcon_fuel'::text AS src, COALESCE(vc.fuel_odometer_changed_at, vc.fetched_at) AS observed_at
       FROM vehicles_cache vc
       LEFT JOIN ov ON ov.vehicle_id = vc.id
      WHERE vc.last_fuel_odometer IS NOT NULL
        AND vc.last_fuel_odometer > 0
-       AND (ov.vehicle_id IS NULL OR ov.superseded_km IS NULL
-            OR vc.last_fuel_odometer <> ov.superseded_km)
+       AND (ov.vehicle_id IS NULL OR COALESCE(vc.fuel_odometer_changed_at, vc.fetched_at) > ov.set_at)
     UNION ALL
-    SELECT vc.id, vc.mileage, 'falcon_mileage', vc.fetched_at
+    SELECT vc.id, vc.mileage, 'falcon_mileage', COALESCE(vc.mileage_changed_at, vc.fetched_at)
       FROM vehicles_cache vc
       LEFT JOIN ov ON ov.vehicle_id = vc.id
      WHERE vc.mileage IS NOT NULL
        AND vc.mileage > 0
-       AND (ov.vehicle_id IS NULL OR ov.superseded_km IS NULL
-            OR vc.mileage <> ov.superseded_km)
+       AND (ov.vehicle_id IS NULL OR COALESCE(vc.mileage_changed_at, vc.fetched_at) > ov.set_at)
     UNION ALL
     SELECT oc.vehicle_id, oc.odometer, 'oil_change', oc.performed_at
       FROM oil_changes oc
