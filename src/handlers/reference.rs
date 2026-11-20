@@ -66,9 +66,7 @@ async fn create_vehicle_class(
     claims: AuthClaims,
     body: web::Json<CreateClassInput>,
 ) -> ApiResult<HttpResponse> {
-    if claims.permission < 3 {
-        return Err(ApiError::Forbidden("vehicle classes require permission >= 3".into()));
-    }
+    claims.require(crate::auth::claims::level::CONFIGURE, "vehicle classes")?;
     let inp = body.into_inner();
     let id = inp.id.trim().to_lowercase().replace(' ', "_");
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {

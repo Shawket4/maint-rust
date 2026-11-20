@@ -12,7 +12,8 @@ use actix_web::{
 use futures::future::LocalBoxFuture;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
-use super::claims::AuthClaims;
+use super::claims::{level, AuthClaims};
+use super::live::Live;
 use crate::error::ApiError;
 
 #[derive(Clone)]
@@ -90,19 +91,40 @@ where
             // Don't validate aud/iss.
             validation.validate_aud = false;
 
-            let claims = match decode::<AuthClaims>(
+            let mut claims = match decode::<AuthClaims>(
                 &token,
                 &DecodingKey::from_secret(secret.as_bytes()),
                 &validation,
             ) {
                 Ok(data) => data.claims,
                 Err(e) => {
-                    return Ok(unauthorized_response(
-                        req,
-                        &format!("invalid token: {e}"),
-                    ));
+                    tracing::debug!(error = %e, "rejected token");
+                    return Ok(unauthorized_response(req, "invalid or expired token"));
                 }
             };
+
+            // Falcon signs driver-app tokens with the same secret. They are
+            // not staff tokens and have no business here.
+            if claims.user_type != "admin_user" {
+                return Ok(error_response(req, ApiError::Forbidden("staff accounts only".into())));
+            }
+
+            // Falcon's current answer beats the month-old snapshot in the token.
+            if let Some(state) = req.app_data::<actix_web::web::Data<crate::handlers::AppState>>() {
+                match state.permissions.lookup(state.falcon_pool.as_ref(), claims.user_id).await {
+                    Live::Known(Some(p)) => claims.permission = p,
+                    Live::Known(None) => {
+                        return Ok(unauthorized_response(req, "this account no longer exists"));
+                    }
+                    Live::Unverified => {}
+                }
+            }
+            if claims.permission < level::USE {
+                return Ok(error_response(
+                    req,
+                    ApiError::Forbidden("this account has no access to maintenance".into()),
+                ));
+            }
 
             req.extensions_mut().insert(claims);
             req.extensions_mut().insert(BearerToken(token));
@@ -114,7 +136,10 @@ where
 }
 
 fn unauthorized_response<B>(req: ServiceRequest, msg: &str) -> ServiceResponse<EitherBody<B>> {
-    let err = ApiError::Unauthorized(msg.to_string());
+    error_response(req, ApiError::Unauthorized(msg.to_string()))
+}
+
+fn error_response<B>(req: ServiceRequest, err: ApiError) -> ServiceResponse<EitherBody<B>> {
     let resp = err.error_response();
     let (http_req, _payload) = req.into_parts();
     ServiceResponse::new(http_req, resp).map_into_right_body()

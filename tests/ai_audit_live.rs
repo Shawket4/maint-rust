@@ -8,7 +8,8 @@
 //!  2. Requests without the header behave as before and are never recorded —
 //!     the desktop app depends on that, at every permission level.
 //!  3. GET /records returns the row + sync_version through the sync map.
-//!  4. /stock/debit refuses non-positive amounts; /service-plans keeps the
+//!  4. Stock credits validate, gate on permission and apply once; driver and
+//!     permission-0 tokens are refused everywhere; /service-plans keeps the
 //!     lead/active values an update omits.
 //!  5. An AI write whose audit row cannot be written is refused (500) and
 //!     never applied.
@@ -63,6 +64,10 @@ async fn state(pool: &PgPool) -> AppState {
         falcon_pool: None,
         anthropic_api_key: None,
         ai_model: "test".into(),
+        permissions: Default::default(),
+        mirror_busy: Default::default(),
+        http: maint_rust::handlers::ai::http_client(),
+        ai_limiter: Default::default(),
     }
 }
 
@@ -217,11 +222,11 @@ async fn ai_write_refused_by_the_handler_is_recorded_with_its_status() {
     let user = fresh_user();
 
     let req = test::TestRequest::post()
-        .uri("/api/maint/stock/debit")
+        .uri("/api/maint/stock/tires/credit")
         .insert_header(bearer(user, 5))
         .insert_header(("X-Via-AI", "advisor"))
         .insert_header(("X-AI-Suggestion-Id", "not-a-uuid"))
-        .set_json(json!({ "kind": "tire_debit", "brand": "X", "qty": 0, "ref_id": Uuid::new_v4() }))
+        .set_json(json!({ "brand": "X", "qty": 0, "ref_id": Uuid::new_v4() }))
         .to_request();
     assert_eq!(test::call_service(&app, req).await.status(), 400);
 
@@ -356,61 +361,87 @@ async fn records_returns_the_row_and_its_sync_version() {
 }
 
 #[actix_web::test]
-async fn debit_refuses_non_positive_amounts() {
+async fn credits_validate_gate_and_apply_once() {
     let Some(pool) = test_pool().await else {
         return;
     };
     let app = app!(pool);
     let user = fresh_user();
     let brand = format!("B-{}", &Uuid::new_v4().to_string()[..8]);
-    sqlx::query(
-        "INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty) VALUES ($1, '', '', 10)",
-    )
-    .bind(&brand)
-    .execute(&pool)
-    .await
-    .unwrap();
 
-    let bad = [
-        json!({ "kind": "tire_debit", "brand": brand, "qty": 0 }),
-        json!({ "kind": "tire_debit", "brand": brand, "qty": -3 }),
-        json!({ "kind": "tire_debit", "brand": brand }),
-        json!({ "kind": "oil_debit", "oil_type": "15W-40", "liters": 0.0 }),
-        json!({ "kind": "oil_debit", "oil_type": "15W-40", "liters": -2.5 }),
-        json!({ "kind": "oil_debit", "oil_type": "15W-40" }),
-    ];
-    for mut b in bad {
-        b["ref_id"] = json!(Uuid::new_v4());
+    // Bad amounts are refused; nothing moves.
+    for b in [json!({ "brand": brand, "qty": 0 }), json!({ "brand": brand, "qty": -3 }), json!({ "brand": " ", "qty": 2 })] {
         let req = test::TestRequest::post()
-            .uri("/api/maint/stock/debit")
-            .insert_header(bearer(user, 1))
+            .uri("/api/maint/stock/tires/credit")
+            .insert_header(bearer(user, 4))
             .set_json(&b)
             .to_request();
         assert_eq!(test::call_service(&app, req).await.status(), 400, "{b}");
     }
-    let on_hand: i32 =
-        sqlx::query_scalar("SELECT on_hand_qty FROM tire_stock_cache WHERE brand = $1")
-            .bind(&brand)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(on_hand, 10, "a refused debit must not move stock");
-
+    for b in [json!({ "oil_type": "15W-40", "liters": 0 }), json!({ "oil_type": "15W-40", "liters": -2.5 })] {
+        let req = test::TestRequest::post()
+            .uri("/api/maint/stock/oil/credit")
+            .insert_header(bearer(user, 4))
+            .set_json(&b)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 400, "{b}");
+    }
+    // Below permission 4: refused.
     let req = test::TestRequest::post()
-        .uri("/api/maint/stock/debit")
-        .insert_header(bearer(user, 1))
-        .set_json(
-            json!({ "kind": "tire_debit", "brand": brand, "qty": 2, "ref_id": Uuid::new_v4() }),
-        )
+        .uri("/api/maint/stock/tires/credit")
+        .insert_header(bearer(user, 3))
+        .set_json(json!({ "brand": brand, "qty": 2 }))
         .to_request();
-    assert_eq!(test::call_service(&app, req).await.status(), 200);
-    let on_hand: i32 =
-        sqlx::query_scalar("SELECT on_hand_qty FROM tire_stock_cache WHERE brand = $1")
-            .bind(&brand)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(on_hand, 8);
+    assert_eq!(test::call_service(&app, req).await.status(), 403);
+
+    // The same ref_id twice credits once, and records who did it.
+    let ref_id = Uuid::new_v4();
+    for _ in 0..2 {
+        let req = test::TestRequest::post()
+            .uri("/api/maint/stock/tires/credit")
+            .insert_header(bearer(user, 4))
+            .set_json(json!({ "brand": brand, "qty": 5, "ref_id": ref_id }))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 200);
+    }
+    let on_hand: i32 = sqlx::query_scalar("SELECT on_hand_qty FROM tire_stock_cache WHERE brand = $1")
+        .bind(&brand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(on_hand, 5);
+    let who: Option<i64> = sqlx::query_scalar("SELECT user_id FROM stock_movements WHERE ref_id = $1")
+        .bind(ref_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(who, Some(user));
+}
+
+/// Tokens that are not staff tokens, or carry no permission, get nothing.
+#[actix_web::test]
+async fn driver_tokens_and_permission_zero_are_refused() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let app = app!(pool);
+    let (driver, _) = mint(SECRET, 77, 5, "driver", 1).unwrap();
+    let (zero, _) = mint(SECRET, 78, 0, "admin_user", 1).unwrap();
+    for (tok, want) in [(driver, 403), (zero, 403)] {
+        for uri in ["/api/maint/sync/pull?entity_type=tires", "/api/maint/categories", "/api/maint/stock/movements"] {
+            let req = test::TestRequest::get()
+                .uri(uri)
+                .insert_header(("Authorization", format!("Bearer {tok}")))
+                .to_request();
+            assert_eq!(test::call_service(&app, req).await.status(), want, "{uri}");
+        }
+        let req = test::TestRequest::post()
+            .uri("/api/maint/sync/push")
+            .insert_header(("Authorization", format!("Bearer {tok}")))
+            .set_json(json!({ "operations": [] }))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), want);
+    }
 }
 
 #[actix_web::test]
@@ -477,7 +508,8 @@ async fn service_plan_update_keeps_omitted_lead_and_active_values() {
     assert_eq!(row["is_active"], true);
     assert_eq!(row["lead_warn_km"], 900);
 
-    // Insert defaults are unchanged.
+    // Insert defaults scale with the interval: a tenth of it, capped at 14
+    // days (a fixed 14 kept a weekly plan permanently "due soon").
     let row: Value = test::read_body_json(
         test::call_service(
             &app,
@@ -490,7 +522,7 @@ async fn service_plan_update_keeps_omitted_lead_and_active_values() {
     )
     .await;
     assert_eq!(row["lead_warn_km"], 500);
-    assert_eq!(row["lead_warn_days"], 14);
+    assert_eq!(row["lead_warn_days"], 9);
     assert_eq!(row["is_active"], true);
 }
 

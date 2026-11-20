@@ -14,7 +14,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::services::sync_engine::EntityType;
 
 /// Columns the client may supply via sync. Excludes audit columns + sync_version + timestamps.
-fn writable_columns(entity: EntityType) -> &'static [&'static str] {
+pub fn writable_columns(entity: EntityType) -> &'static [&'static str] {
     match entity {
         EntityType::WorkOrders => &[
             "id", "vehicle_id", "status", "title", "odometer_at_open",
@@ -22,7 +22,7 @@ fn writable_columns(entity: EntityType) -> &'static [&'static str] {
         ],
         EntityType::WorkOrderTasks => &[
             "id", "work_order_id", "kind", "category_id",
-            "description_ar", "description_en", "is_done", "sort_order",
+            "description_ar", "description_en", "is_done", "done_at", "sort_order",
         ],
         EntityType::Tires => &[
             "id", "dot_code", "brand", "model", "size",
@@ -96,7 +96,7 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         // Timestamptz columns
         (_, "set_at") | (_, "performed_at") | (_, "occurred_at") |
         (_, "opened_at") | (_, "closed_at") |
-        (_, "mounted_at") | (_, "dismounted_at") => "::timestamptz",
+        (_, "mounted_at") | (_, "dismounted_at") | (_, "done_at") => "::timestamptz",
         // Boolean columns
         (_, "is_done") | (_, "is_steering") | (_, "is_lifted") |
         (_, "is_spare") | (_, "flagged") => "::boolean",
@@ -145,7 +145,7 @@ pub async fn insert_from_payload(
     let mut q = format!(
         "INSERT INTO {table} ({cols_sql}) VALUES ({vals_sql})"
     );
-    if entity.upserts_on_conflict() {
+    if entity.is_singleton() {
         q.push_str(" ON CONFLICT (vehicle_id) DO UPDATE SET ");
         let mut updates = Vec::new();
         for col in col_list.iter() {
@@ -168,18 +168,7 @@ pub async fn insert_from_payload(
         .bind(user_id)
         .fetch_one(&mut **tx)
         .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(db) if db.is_check_violation() => {
-                ApiError::BadRequest(format!("check constraint failed: {}", db.message()))
-            }
-            sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
-                ApiError::BadRequest(format!("foreign key violation: {}", db.message()))
-            }
-            sqlx::Error::Database(db) if db.is_unique_violation() => {
-                ApiError::Conflict(format!("unique violation: {}", db.message()))
-            }
-            _ => ApiError::Db(e),
-        })?;
+        ?;
     Ok(sv)
 }
 
@@ -201,6 +190,7 @@ pub async fn update_from_payload(
 ) -> ApiResult<Option<i64>> {
     let table = entity.table_name();
     let pk = entity.pk_column();
+    let pk_cast = entity.pk_cast();
     let cols = writable_columns(entity);
 
     let mut sets: Vec<String> = Vec::new();
@@ -227,7 +217,7 @@ pub async fn update_from_payload(
 
     let set_sql = sets.join(", ");
     let q = format!(
-        "UPDATE {table} SET {set_sql} WHERE {pk}::text = $3 AND sync_version = $4 RETURNING sync_version"
+        "UPDATE {table} SET {set_sql} WHERE {pk} = $3{pk_cast} AND sync_version = $4 RETURNING sync_version"
     );
     let sv: Option<(i64,)> = sqlx::query_as(&q)
         .bind(payload)
@@ -236,14 +226,94 @@ pub async fn update_from_payload(
         .bind(expected_sync_version)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(db) if db.is_check_violation() => {
-                ApiError::BadRequest(format!("check constraint failed: {}", db.message()))
-            }
-            sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
-                ApiError::BadRequest(format!("foreign key violation: {}", db.message()))
-            }
-            _ => ApiError::Db(e),
-        })?;
+        ?;
     Ok(sv.map(|t| t.0))
+}
+
+/// Version-guarded tombstone. None = the guard matched no row.
+pub async fn soft_delete(
+    tx: &mut Transaction<'_, Postgres>,
+    entity: EntityType,
+    entity_id: &str,
+    user_id: i64,
+    expected_sync_version: i64,
+) -> ApiResult<Option<i64>> {
+    let table = entity.table_name();
+    let pk = entity.pk_column();
+    let cast = entity.pk_cast();
+    let q = format!(
+        "UPDATE {table}
+            SET deleted_at = now(), updated_by_user_id = $1, sync_version = sync_version + 1
+          WHERE {pk} = $2{cast} AND sync_version = $3
+          RETURNING sync_version"
+    );
+    let sv: Option<(i64,)> = sqlx::query_as(&q)
+        .bind(user_id)
+        .bind(entity_id)
+        .bind(expected_sync_version)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(sv.map(|t| t.0))
+}
+
+/// Does the stored row already hold everything this payload would write?
+/// Used only for clients without op ids, to tell a redelivered update (the
+/// ack was lost) from a real conflict.
+pub fn payload_matches_row(entity: EntityType, payload: &Value, row: &Value) -> bool {
+    let pk = entity.pk_column();
+    writable_columns(entity).iter().filter(|c| **c != pk).all(|col| match payload.get(col) {
+        None => true,
+        Some(sent) => loosely_equal(sent, row.get(col).unwrap_or(&Value::Null)),
+    })
+}
+
+fn loosely_equal(a: &Value, b: &Value) -> bool {
+    use chrono::DateTime;
+    let num = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    };
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::String(x), Value::String(y)) => {
+            if x == y {
+                return true;
+            }
+            match (DateTime::parse_from_rfc3339(x), DateTime::parse_from_rfc3339(y)) {
+                (Ok(tx), Ok(ty)) => (tx.timestamp_millis() - ty.timestamp_millis()).abs() < 2,
+                _ => match (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
+                    (Ok(fx), Ok(fy)) => (fx - fy).abs() < 1e-9,
+                    _ => x.eq_ignore_ascii_case(y) && uuid::Uuid::parse_str(x).is_ok(),
+                },
+            }
+        }
+        _ => match (num(a), num(b)) {
+            (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+            _ => false,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn replayed_update_is_recognised() {
+        let row = json!({"id": "a", "work_order_id": "w", "is_done": true, "sort_order": 3,
+                          "done_at": "2026-11-01T10:00:00.000+00:00", "description_ar": "x", "category_id": null});
+        let same = json!({"is_done": 1, "sort_order": "3", "done_at": "2026-11-01T10:00:00Z",
+                           "description_ar": "x", "category_id": null});
+        assert!(payload_matches_row(EntityType::WorkOrderTasks, &same, &row));
+        let other = json!({"is_done": false});
+        assert!(!payload_matches_row(EntityType::WorkOrderTasks, &other, &row));
+        let other = json!({"category_id": "brakes"});
+        assert!(!payload_matches_row(EntityType::WorkOrderTasks, &other, &row));
+    }
 }

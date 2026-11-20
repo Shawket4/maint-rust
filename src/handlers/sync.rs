@@ -3,6 +3,7 @@ use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 
 use crate::auth::middleware::BearerToken;
+use crate::auth::claims::level;
 use crate::auth::AuthClaims;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
@@ -19,26 +20,24 @@ async fn sync_push(
     token: BearerToken,
     body: web::Json<PushBody>,
 ) -> ApiResult<HttpResponse> {
-    // Per §7.2 each operation is independent: applied / conflict / error per row.
-    // apply_push_batch wraps every op in a SAVEPOINT so a constraint violation
-    // rolls back only its own op instead of aborting the whole batch.
-    let (resp, _debit_refs) =
-        apply_push_batch(&state.pool, &body.into_inner(), claims.user_id).await?;
-    // Stock movements derived while applying (oil changes, mounts from stock)
-    // are mirrored up to Falcon AFTER the commit — best-effort, idempotent on
-    // ref_id. The unmirrored sweep also replays any backlog whose earlier
-    // mirror attempt failed (this call IS the "retried later" the marker
-    // column promises — one indexed SELECT when the backlog is empty; the
-    // fresh refs from this batch are part of the unmirrored set).
-    stock_ledger::mirror_unmirrored(&state, &token.0).await;
+    claims.require(level::USE, "syncing")?;
+    let (resp, stock_moved) = apply_push_batch(&state.pool, &body.into_inner(), claims.user_id).await?;
+    // Stock movements go up to Falcon in the background. Doing it here made
+    // the client wait on up to 100 upstream calls and time out on a push that
+    // had already committed.
+    if stock_moved {
+        stock_ledger::spawn_mirror(&state, &token.0);
+    }
     Ok(HttpResponse::Ok().json(resp))
 }
 
 #[get("/sync/pull")]
 async fn sync_pull(
     pool: web::Data<PgPool>,
+    claims: AuthClaims,
     q: web::Query<PullQuery>,
 ) -> ApiResult<HttpResponse> {
+    claims.require(level::USE, "syncing")?;
     let since = q.since.unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
     let limit = q.limit.clamp(1, 1000);
     let resp: PullResponse =

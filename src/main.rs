@@ -66,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
         falcon_pool,
         anthropic_api_key: cfg.anthropic_api_key.clone(),
         ai_model: cfg.ai_model.clone(),
+        permissions: Default::default(),
+        mirror_busy: Default::default(),
+        http: handlers::ai::http_client(),
+        ai_limiter: Default::default(),
     };
 
     let bind = (cfg.bind_addr.clone(), cfg.port);

@@ -35,6 +35,14 @@ pub struct AppState {
     pub falcon_pool: Option<PgPool>,
     pub anthropic_api_key: Option<String>,
     pub ai_model: String,
+    /// Live Falcon permission lookups (cached), see auth::live.
+    pub permissions: crate::auth::live::PermissionCache,
+    /// True while a background stock-mirror sweep is running.
+    pub mirror_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared HTTP client for the AI endpoint (timeouts set once).
+    pub http: reqwest::Client,
+    /// Per-user AI request budget.
+    pub ai_limiter: crate::handlers::ai::RateLimiter,
 }
 
 /// Everything under /api/maint. Shared by main.rs and the HTTP tests so both

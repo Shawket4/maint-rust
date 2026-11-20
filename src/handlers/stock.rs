@@ -9,127 +9,134 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::middleware::BearerToken;
+use crate::auth::claims::level;
 use crate::auth::AuthClaims;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::handlers::AppState;
 use crate::services::stock_ledger;
 
-/// Mirror Falcon's authoritative tire ledger into tire_stock_cache, then return it (§4).
-#[get("/stock/tires")]
-async fn tire_stock(state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
-    // Replay any unmirrored debits FIRST — the refresh below overwrites our
-    // local decrements with Falcon's counts, so Falcon must see the debits
-    // before its numbers become ours.
-    stock_ledger::mirror_unmirrored(&state, &token.0).await;
-    if let Ok(v) = state.falcon.get_json("/api/maint-stock/tires", &token.0).await {
-        if let Some(arr) = v.as_array() {
-            for row in arr {
-                let brand = row.get("brand").and_then(|x| x.as_str()).unwrap_or("");
-                let model = row.get("model").and_then(|x| x.as_str()).unwrap_or("");
-                let size = row.get("size").and_then(|x| x.as_str()).unwrap_or("");
-                let qty = row.get("on_hand_qty").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-                let _ = sqlx::query(
-                    "INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty) VALUES ($1,$2,$3,$4) \
-                     ON CONFLICT (brand, model, size) DO UPDATE SET on_hand_qty = EXCLUDED.on_hand_qty, fetched_at = now()",
-                ).bind(brand).bind(model).bind(size).bind(qty).execute(&state.pool).await;
+/// Falcon's counts are authoritative, but they do not yet include movements
+/// we recorded and have not managed to push up. on-hand = Falcon's number plus
+/// our pending movements — never just Falcon's number, which silently gave
+/// consumed stock back.
+async fn refresh_tire_cache(state: &AppState, token: &str) -> bool {
+    let Ok(v) = state.falcon.get_json("/api/maint-stock/tires", token).await else { return false };
+    let Some(arr) = v.as_array().or_else(|| v.get("data").and_then(Value::as_array)) else { return false };
+    let Ok(mut tx) = state.pool.begin().await else { return false };
+    let ok = async {
+        sqlx::query("UPDATE tire_stock_cache SET on_hand_qty = 0").execute(&mut *tx).await?;
+        for row in arr {
+            let brand = row.get("brand").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if brand.is_empty() {
+                continue;
             }
+            let model = row.get("model").and_then(|x| x.as_str()).unwrap_or("").trim();
+            let size = row.get("size").and_then(|x| x.as_str()).unwrap_or("").trim();
+            let qty = row.get("on_hand_qty").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            sqlx::query(
+                "INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty) VALUES ($1,$2,$3,$4) \
+                 ON CONFLICT (brand, model, size) DO UPDATE SET on_hand_qty = EXCLUDED.on_hand_qty, fetched_at = now()",
+            )
+            .bind(brand).bind(model).bind(size).bind(qty)
+            .execute(&mut *tx).await?;
+        }
+        // Re-apply what Falcon has not seen yet.
+        sqlx::query(
+            "INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty) \
+             SELECT btrim(brand), COALESCE(btrim(model),''), COALESCE(btrim(size),''), \
+                    SUM(CASE WHEN kind = 'tire_credit' THEN qty ELSE -qty END)::int \
+               FROM stock_movements \
+              WHERE kind IN ('tire_debit','tire_credit') AND mirrored_to_falcon_at IS NULL \
+                AND brand IS NOT NULL AND qty IS NOT NULL \
+              GROUP BY 1,2,3 \
+             ON CONFLICT (brand, model, size) DO UPDATE \
+                SET on_hand_qty = tire_stock_cache.on_hand_qty + EXCLUDED.on_hand_qty",
+        )
+        .execute(&mut *tx).await?;
+        // A line Falcon no longer lists and nothing is pending against is gone.
+        sqlx::query("DELETE FROM tire_stock_cache WHERE on_hand_qty = 0 AND fetched_at < now()")
+            .execute(&mut *tx).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    match ok {
+        Ok(()) => tx.commit().await.is_ok(),
+        Err(e) => {
+            tracing::warn!(error = %e, "tire stock refresh failed");
+            false
         }
     }
+}
+
+async fn refresh_oil_cache(state: &AppState, token: &str) -> bool {
+    let Ok(v) = state.falcon.get_json("/api/maint-stock/oil", token).await else { return false };
+    let Some(arr) = v.as_array().or_else(|| v.get("data").and_then(Value::as_array)) else { return false };
+    let Ok(mut tx) = state.pool.begin().await else { return false };
+    let ok = async {
+        sqlx::query("UPDATE oil_stock_cache SET liters_on_hand = 0").execute(&mut *tx).await?;
+        for row in arr {
+            let oil = row.get("oil_type").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if oil.is_empty() {
+                continue;
+            }
+            let liters = row.get("liters_on_hand").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            sqlx::query(
+                "INSERT INTO oil_stock_cache (oil_type, liters_on_hand) VALUES ($1,$2) \
+                 ON CONFLICT (oil_type) DO UPDATE SET liters_on_hand = EXCLUDED.liters_on_hand, fetched_at = now()",
+            )
+            .bind(oil).bind(liters)
+            .execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "INSERT INTO oil_stock_cache (oil_type, liters_on_hand) \
+             SELECT btrim(oil_type), SUM(CASE WHEN kind = 'oil_credit' THEN liters ELSE -liters END) \
+               FROM stock_movements \
+              WHERE kind IN ('oil_debit','oil_credit') AND mirrored_to_falcon_at IS NULL \
+                AND oil_type IS NOT NULL AND liters IS NOT NULL \
+              GROUP BY 1 \
+             ON CONFLICT (oil_type) DO UPDATE \
+                SET liters_on_hand = oil_stock_cache.liters_on_hand + EXCLUDED.liters_on_hand",
+        )
+        .execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM oil_stock_cache WHERE liters_on_hand = 0 AND fetched_at < now()")
+            .execute(&mut *tx).await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    match ok {
+        Ok(()) => tx.commit().await.is_ok(),
+        Err(e) => {
+            tracing::warn!(error = %e, "oil stock refresh failed");
+            false
+        }
+    }
+}
+
+/// Tire stock. `X-Stock-Fresh: false` says Falcon could not be reached and
+/// the numbers are the last mirror plus our own movements.
+#[get("/stock/tires")]
+async fn tire_stock(state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
+    stock_ledger::spawn_mirror(&state, &token.0);
+    let fresh = refresh_tire_cache(&state, &token.0).await;
     let rows: Vec<(Value,)> = sqlx::query_as(
         "SELECT to_jsonb(s) FROM tire_stock_cache s ORDER BY brand, model, size",
     ).fetch_all(&state.pool).await?;
-    Ok(HttpResponse::Ok().json(rows.into_iter().map(|(v,)| v).collect::<Vec<_>>()))
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Stock-Fresh", if fresh { "true" } else { "false" }))
+        .json(rows.into_iter().map(|(v,)| v).collect::<Vec<_>>()))
 }
 
 #[get("/stock/oil")]
 async fn oil_stock(state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
-    // Same ordering rule as /stock/tires: debits reach Falcon before Falcon's
-    // counts replace the local cache.
-    stock_ledger::mirror_unmirrored(&state, &token.0).await;
-    if let Ok(v) = state.falcon.get_json("/api/maint-stock/oil", &token.0).await {
-        if let Some(arr) = v.as_array() {
-            for row in arr {
-                let oil = row.get("oil_type").and_then(|x| x.as_str()).unwrap_or("");
-                let liters = row.get("liters_on_hand").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let _ = sqlx::query(
-                    "INSERT INTO oil_stock_cache (oil_type, liters_on_hand) VALUES ($1,$2) \
-                     ON CONFLICT (oil_type) DO UPDATE SET liters_on_hand = EXCLUDED.liters_on_hand, fetched_at = now()",
-                ).bind(oil).bind(liters).execute(&state.pool).await;
-            }
-        }
-    }
+    stock_ledger::spawn_mirror(&state, &token.0);
+    let fresh = refresh_oil_cache(&state, &token.0).await;
     let rows: Vec<(Value,)> =
         sqlx::query_as("SELECT to_jsonb(s) FROM oil_stock_cache s ORDER BY oil_type")
             .fetch_all(&state.pool).await?;
-    Ok(HttpResponse::Ok().json(rows.into_iter().map(|(v,)| v).collect::<Vec<_>>()))
-}
-
-/// Debit stock: record the movement locally, decrement the cache, and push the
-/// debit up to Falcon (§4). Idempotent upstream on ref_id.
-#[derive(Debug, Deserialize)]
-struct DebitInput {
-    kind: String,       // tire_debit | oil_debit
-    brand: Option<String>,
-    model: Option<String>,
-    size: Option<String>,
-    oil_type: Option<String>,
-    qty: Option<i32>,
-    liters: Option<f64>,
-    ref_id: String,     // the mount/oil-change UUID (idempotency key)
-    work_order_id: Option<String>,
-}
-
-#[post("/stock/debit")]
-async fn debit_stock(
-    state: web::Data<AppState>,
-    token: BearerToken,
-    body: web::Json<DebitInput>,
-) -> ApiResult<HttpResponse> {
-    let d = body.into_inner();
-    let ref_uuid = uuid::Uuid::parse_str(&d.ref_id)
-        .map_err(|_| ApiError::BadRequest("ref_id must be a uuid".into()))?;
-
-    let kind: &'static str = match d.kind.as_str() {
-        "tire_debit" => "tire_debit",
-        "oil_debit" => "oil_debit",
-        other => {
-            return Err(ApiError::BadRequest(format!("unknown debit kind: {other}")));
-        }
-    };
-    // A zero/negative amount would credit stock through the debit path (and an
-    // omitted one recorded an empty movement). Nothing in the desktop app calls
-    // this route — its debits are derived server-side from synced oil changes
-    // and mounts — so every amount here is a deliberate, positive one.
-    match kind {
-        "tire_debit" if d.qty.map_or(true, |q| q <= 0) => {
-            return Err(ApiError::BadRequest("tire_debit needs qty > 0".into()));
-        }
-        "oil_debit" if d.liters.map_or(true, |l| !l.is_finite() || l <= 0.0) => {
-            return Err(ApiError::BadRequest("oil_debit needs liters > 0".into()));
-        }
-        _ => {}
-    }
-    let spec = stock_ledger::DebitSpec {
-        kind,
-        brand: d.brand,
-        model: d.model,
-        size: d.size,
-        oil_type: d.oil_type,
-        qty: d.qty,
-        liters: d.liters,
-        ref_id: ref_uuid,
-        work_order_id: d.work_order_id.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
-    };
-
-    // Local movement + cache decrement (idempotent on ref_id).
-    let mut tx = state.pool.begin().await?;
-    stock_ledger::record_debit(&mut tx, &spec).await?;
-    tx.commit().await?;
-
-    // Push up to Falcon (best-effort; idempotent on ref_id upstream).
-    stock_ledger::mirror_debits(&state, &token.0, &[ref_uuid]).await;
-    Ok(HttpResponse::Ok().json(json!({"ok": true})))
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Stock-Fresh", if fresh { "true" } else { "false" }))
+        .json(rows.into_iter().map(|(v,)| v).collect::<Vec<_>>()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,88 +145,10 @@ struct TireCredit {
     model: Option<String>,
     size: Option<String>,
     qty: i32,
-    /// Idempotency key. A retried/double-clicked credit with the same ref_id is
-    /// a no-op (returns the current on-hand). Absent = a fresh, non-idempotent
-    /// credit (server mints one). The movement row records the same key.
+    /// Idempotency key: a retried or double-clicked credit with the same
+    /// ref_id is a no-op. Send one — without it a retry credits twice.
     ref_id: Option<String>,
-}
-
-#[post("/stock/tires/credit")]
-async fn credit_tires(
-    pool: web::Data<PgPool>,
-    claims: AuthClaims,
-    body: web::Json<TireCredit>,
-) -> ApiResult<HttpResponse> {
-    if claims.permission < 4 {
-        return Err(ApiError::Forbidden("stock credit requires permission >= 4".into()));
-    }
-    let b = body.into_inner();
-    if b.qty <= 0 {
-        return Err(ApiError::BadRequest("qty must be > 0".into()));
-    }
-    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?;
-
-    // Race-free idempotency: insert the movement FIRST with ON CONFLICT DO
-    // NOTHING on the unique ref_id (0018). If nothing was inserted, this ref_id
-    // already applied — return the current on-hand without bumping. Cache bump
-    // + movement in ONE transaction.
-    let mut tx = pool.begin().await?;
-    let logged: Option<(uuid::Uuid,)> = sqlx::query_as(
-        "INSERT INTO stock_movements (kind, brand, model, size, qty, ref_id) \
-         VALUES ('tire_credit', $1, $2, $3, $4, COALESCE($5, gen_random_uuid())) \
-         ON CONFLICT (ref_id) WHERE ref_id IS NOT NULL DO NOTHING RETURNING id",
-    )
-    .bind(&b.brand)
-    .bind(&b.model)
-    .bind(&b.size)
-    .bind(b.qty)
-    .bind(ref_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if logged.is_none() {
-        // Idempotency is keyed on ref_id alone — a replay may carry a different
-        // brand/model/size than the original (a client that reused a key). Read
-        // this request's key with fetch_OPTIONAL and synthesize a zero-on-hand
-        // row when it doesn't exist, so a mismatched replay is a benign no-op,
-        // never a RowNotFound → 500.
-        let row: Option<(Value,)> = sqlx::query_as(
-            "SELECT to_jsonb(t) FROM tire_stock_cache t \
-             WHERE brand=$1 AND model=COALESCE($2,'') AND size=COALESCE($3,'')",
-        )
-        .bind(&b.brand)
-        .bind(&b.model)
-        .bind(&b.size)
-        .fetch_optional(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        let out = row.map(|r| r.0).unwrap_or_else(|| {
-            json!({
-                "brand": b.brand,
-                "model": b.model.clone().unwrap_or_default(),
-                "size": b.size.clone().unwrap_or_default(),
-                "on_hand_qty": 0,
-            })
-        });
-        return Ok(HttpResponse::Ok().json(out));
-    }
-    let row: (Value,) = sqlx::query_as(
-        r#"
-        INSERT INTO tire_stock_cache (brand, model, size, on_hand_qty)
-        VALUES ($1, COALESCE($2,''), COALESCE($3,''), $4)
-        ON CONFLICT (brand, model, size) DO UPDATE SET
-            on_hand_qty = tire_stock_cache.on_hand_qty + EXCLUDED.on_hand_qty,
-            fetched_at = now()
-        RETURNING to_jsonb(tire_stock_cache)
-        "#,
-    )
-    .bind(&b.brand)
-    .bind(&b.model)
-    .bind(&b.size)
-    .bind(b.qty)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(HttpResponse::Ok().json(row.0))
+    note: Option<String>,
 }
 
 fn parse_opt_uuid(s: Option<&str>) -> ApiResult<Option<uuid::Uuid>> {
@@ -231,70 +160,118 @@ fn parse_opt_uuid(s: Option<&str>) -> ApiResult<Option<uuid::Uuid>> {
     }
 }
 
+fn clean(s: Option<&str>, what: &str) -> ApiResult<Option<String>> {
+    match s.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(None),
+        Some(t) if t.contains('\0') || t.chars().count() > 120 => {
+            Err(ApiError::BadRequest(format!("{what} is not valid")))
+        }
+        Some(t) => Ok(Some(t.to_string())),
+    }
+}
+
+#[post("/stock/tires/credit")]
+async fn credit_tires(
+    state: web::Data<AppState>,
+    claims: AuthClaims,
+    token: BearerToken,
+    body: web::Json<TireCredit>,
+) -> ApiResult<HttpResponse> {
+    claims.require(level::STOCK_CREDIT, "adding stock")?;
+    let b = body.into_inner();
+    if b.qty <= 0 || b.qty > 10_000 {
+        return Err(ApiError::BadRequest("qty must be between 1 and 10000".into()));
+    }
+    let brand = clean(Some(&b.brand), "brand")?.ok_or_else(|| ApiError::BadRequest("brand is required".into()))?;
+    let model = clean(b.model.as_deref(), "model")?;
+    let size = clean(b.size.as_deref(), "size")?;
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?.unwrap_or_else(uuid::Uuid::new_v4);
+
+    let mut tx = state.pool.begin().await?;
+    stock_ledger::record(
+        &mut tx,
+        &stock_ledger::Movement {
+            kind: "tire_credit",
+            brand: Some(brand.clone()),
+            model: model.clone(),
+            size: size.clone(),
+            oil_type: None,
+            qty: Some(b.qty),
+            liters: None,
+            ref_id,
+            work_order_id: None,
+            user_id: Some(claims.user_id),
+            note: clean(b.note.as_deref(), "note")?,
+        },
+    )
+    .await?;
+    let row: Option<(Value,)> = sqlx::query_as(
+        "SELECT to_jsonb(t) FROM tire_stock_cache t \
+          WHERE brand = $1 AND model = COALESCE($2,'') AND size = COALESCE($3,'')",
+    )
+    .bind(&brand)
+    .bind(&model)
+    .bind(&size)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    stock_ledger::spawn_mirror(&state, &token.0);
+    Ok(HttpResponse::Ok().json(row.map(|r| r.0).unwrap_or_else(|| {
+        json!({ "brand": brand, "model": model.unwrap_or_default(), "size": size.unwrap_or_default(), "on_hand_qty": 0 })
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 struct OilCredit {
     oil_type: String,
     liters: f64,
     /// Idempotency key — see TireCredit::ref_id.
     ref_id: Option<String>,
+    note: Option<String>,
 }
 
 #[post("/stock/oil/credit")]
 async fn credit_oil(
-    pool: web::Data<PgPool>,
+    state: web::Data<AppState>,
     claims: AuthClaims,
+    token: BearerToken,
     body: web::Json<OilCredit>,
 ) -> ApiResult<HttpResponse> {
-    if claims.permission < 4 {
-        return Err(ApiError::Forbidden("stock credit requires permission >= 4".into()));
-    }
+    claims.require(level::STOCK_CREDIT, "adding stock")?;
     let b = body.into_inner();
-    if b.liters <= 0.0 || b.liters.is_nan() {
-        return Err(ApiError::BadRequest("liters must be > 0".into()));
+    if !b.liters.is_finite() || b.liters <= 0.0 || b.liters > 100_000.0 {
+        return Err(ApiError::BadRequest("liters must be between 0 and 100000".into()));
     }
-    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?;
+    let oil_type =
+        clean(Some(&b.oil_type), "oil_type")?.ok_or_else(|| ApiError::BadRequest("oil_type is required".into()))?;
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?.unwrap_or_else(uuid::Uuid::new_v4);
 
-    let mut tx = pool.begin().await?;
-    let logged: Option<(uuid::Uuid,)> = sqlx::query_as(
-        "INSERT INTO stock_movements (kind, oil_type, liters, ref_id) \
-         VALUES ('oil_credit', $1, $2, COALESCE($3, gen_random_uuid())) \
-         ON CONFLICT (ref_id) WHERE ref_id IS NOT NULL DO NOTHING RETURNING id",
+    let mut tx = state.pool.begin().await?;
+    stock_ledger::record(
+        &mut tx,
+        &stock_ledger::Movement {
+            kind: "oil_credit",
+            brand: None,
+            model: None,
+            size: None,
+            oil_type: Some(oil_type.clone()),
+            qty: None,
+            liters: Some((b.liters * 100.0).round() / 100.0),
+            ref_id,
+            work_order_id: None,
+            user_id: Some(claims.user_id),
+            note: clean(b.note.as_deref(), "note")?,
+        },
     )
-    .bind(&b.oil_type)
-    .bind(b.liters)
-    .bind(ref_id)
-    .fetch_optional(&mut *tx)
     .await?;
-    if logged.is_none() {
-        // See credit_tires: idempotency is keyed on ref_id, so a replay may name
-        // a different oil_type than the original. fetch_OPTIONAL + zero fallback.
-        let row: Option<(Value,)> =
-            sqlx::query_as("SELECT to_jsonb(t) FROM oil_stock_cache t WHERE oil_type=$1")
-                .bind(&b.oil_type)
-                .fetch_optional(&mut *tx)
-                .await?;
-        tx.commit().await?;
-        let out = row.map(|r| r.0).unwrap_or_else(|| {
-            json!({ "oil_type": b.oil_type, "liters_on_hand": 0.0 })
-        });
-        return Ok(HttpResponse::Ok().json(out));
-    }
-    let row: (Value,) = sqlx::query_as(
-        r#"
-        INSERT INTO oil_stock_cache (oil_type, liters_on_hand)
-        VALUES ($1, $2)
-        ON CONFLICT (oil_type) DO UPDATE SET
-            liters_on_hand = oil_stock_cache.liters_on_hand + EXCLUDED.liters_on_hand,
-            fetched_at = now()
-        RETURNING to_jsonb(oil_stock_cache)
-        "#,
-    )
-    .bind(&b.oil_type)
-    .bind(b.liters)
-    .fetch_one(&mut *tx)
-    .await?;
+    let row: Option<(Value,)> = sqlx::query_as("SELECT to_jsonb(t) FROM oil_stock_cache t WHERE oil_type = $1")
+        .bind(&oil_type)
+        .fetch_optional(&mut *tx)
+        .await?;
     tx.commit().await?;
-    Ok(HttpResponse::Ok().json(row.0))
+    stock_ledger::spawn_mirror(&state, &token.0);
+    Ok(HttpResponse::Ok()
+        .json(row.map(|r| r.0).unwrap_or_else(|| json!({ "oil_type": oil_type, "liters_on_hand": 0.0 }))))
 }
 
 /// The in/out ledger: every recorded stock movement (debits from oil changes
@@ -334,11 +311,12 @@ async fn stock_movements(
              -- client's offline lexical ORDER BY created_at is always correct
              -- (a Cairo-DST session tz would otherwise vary the offset).
              'created_at', to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
-             'mirrored', (m.mirrored_to_falcon_at IS NOT NULL))
+             'mirrored', (m.mirrored_to_falcon_at IS NOT NULL),
+             'mirror_error', m.mirror_error, 'user_id', m.user_id, 'note', m.note)
            FROM stock_movements m
            LEFT JOIN work_orders wo ON wo.id = m.work_order_id
            LEFT JOIN vehicles_cache v ON v.id = wo.vehicle_id
-          WHERE ($3::timestamptz IS NULL OR m.created_at >= $3::timestamptz){kind_filter}
+          WHERE ($3::text IS NULL OR m.created_at >= CASE WHEN $3 ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN ($3::date)::timestamp AT TIME ZONE 'Africa/Cairo' ELSE $3::timestamptz END){kind_filter}
           ORDER BY m.created_at DESC, m.id DESC
           LIMIT $1 OFFSET $2"
     );
@@ -388,7 +366,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(tire_stock)
         .service(oil_stock)
         .service(stock_movements)
-        .service(debit_stock)
         .service(credit_tires)
         .service(credit_oil)
         .service(dev_seed);

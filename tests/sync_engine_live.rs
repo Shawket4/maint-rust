@@ -19,7 +19,7 @@ use maint_rust::services::sync_engine::{
     apply_push_batch, pull_rows, EntityType, PushBody, PushOperation, PushResultStatus,
     SyncOperation,
 };
-use maint_rust::services::stock_ledger::{record_debit, DebitSpec};
+use maint_rust::services::stock_ledger::{record, Movement};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -52,6 +52,8 @@ fn insert_op(entity_type: EntityType, id: &str, payload: Value) -> PushOperation
         operation: SyncOperation::Insert,
         payload,
         sync_version: 0,
+        op_id: None,
+        group_id: None,
     }
 }
 
@@ -312,7 +314,7 @@ async fn oil_change_debits_ledger_once_and_server_owns_the_flag() {
     let body = PushBody { operations: vec![op] };
     let (resp, refs) = apply_push_batch(&pool, &body, 1).await.unwrap();
     assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }));
-    assert_eq!(refs, vec![oc], "debit ref surfaces for Falcon mirroring");
+    assert!(refs, "a stock movement is reported for Falcon mirroring");
 
     let flagged: bool = sqlx::query_scalar("SELECT flagged FROM oil_changes WHERE id = $1")
         .bind(oc)
@@ -349,7 +351,7 @@ async fn oil_change_debits_ledger_once_and_server_owns_the_flag() {
         matches!(resp2.results[0], PushResultStatus::Applied { .. }),
         "replayed insert acks as no-op, not conflict"
     );
-    assert!(refs2.is_empty());
+    assert!(!refs2);
     let movements: i64 =
         sqlx::query_scalar("SELECT count(*) FROM stock_movements WHERE ref_id = $1")
             .bind(oc)
@@ -409,7 +411,7 @@ async fn mount_from_shipment_debits_stock_and_dismount_derives_status_and_km() {
     let (resp, refs) = apply_push_batch(&pool, &body, 1).await.unwrap();
     assert!(matches!(resp.results[0], PushResultStatus::Applied { .. }));
     assert!(matches!(resp.results[1], PushResultStatus::Applied { .. }));
-    assert_eq!(refs, vec![tire], "new-from-stock mount debits the tire ledger");
+    assert!(refs, "new-from-stock mount debits the tire ledger");
 
     let qty: i32 = sqlx::query_scalar(
         "SELECT on_hand_qty FROM tire_stock_cache WHERE brand = $1 AND model = 'M' AND size = 'S'",
@@ -443,6 +445,8 @@ async fn mount_from_shipment_debits_stock_and_dismount_derives_status_and_km() {
             "dismount_reason": "worn",
         }),
         sync_version: sv,
+        op_id: None,
+        group_id: None,
     };
     let (resp2, _) =
         apply_push_batch(&pool, &PushBody { operations: vec![dismount] }, 1).await.unwrap();
@@ -477,6 +481,8 @@ fn update_op(entity_type: EntityType, id: &str, payload: Value, sv: i64) -> Push
         operation: SyncOperation::Update,
         payload,
         sync_version: sv,
+        op_id: None,
+        group_id: None,
     }
 }
 
@@ -487,6 +493,8 @@ fn delete_op(entity_type: EntityType, id: &str, sv: i64) -> PushOperation {
         operation: SyncOperation::Delete,
         payload: Value::Null,
         sync_version: sv,
+        op_id: None,
+        group_id: None,
     }
 }
 
@@ -551,6 +559,8 @@ async fn singleton_reinsert_resurrects_tombstoned_class_assignment() {
         operation: SyncOperation::Insert,
         payload: json!({ "vehicle_id": vid, "class_id": class_id }),
         sync_version: sv,
+        op_id: None,
+        group_id: None,
     };
 
     let (resp, _) =
@@ -847,9 +857,15 @@ async fn stale_update_conflicts_and_reports_server_row() {
 /// plan whose latest record has no odometer is 'never_done', not silently
 /// 'ok' forever.
 #[tokio::test]
-async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
+async fn due_clock_ignores_undone_tasks_and_keeps_the_last_km_baseline() {
     let Some(pool) = test_pool().await else { return };
     let vid = fresh_vehicle_id();
+    // The due board lists live fleet vehicles only.
+    sqlx::query("INSERT INTO vehicles_cache (id, car_no_plate, raw_payload) VALUES ($1, 'DUE TEST', '{}'::jsonb)")
+        .bind(vid as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let class_id = format!("test-class-{}", &Uuid::new_v4().to_string()[..8]);
     sqlx::query("INSERT INTO vehicle_classes (id, name_ar, name_en) VALUES ($1, 'اختبار', 'Test')")
@@ -892,7 +908,7 @@ async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
     let wo = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO work_orders (id, vehicle_id, status, odometer_at_open, created_by_user_id, updated_by_user_id)
-         VALUES ($1, $2, 'closed', 500000, 1, 1)",
+         VALUES ($1, $2, 'open', 500000, 1, 1)",
     )
     .bind(wo)
     .bind(vid as i32)
@@ -923,12 +939,12 @@ async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
         .unwrap();
     assert_ne!(due_status(&pool, plan, vid).await, "never_done", "done task resets the clock");
 
-    // A LATER record with no odometer erases the km baseline → never_done
-    // again (not a silent forever-'ok').
+    // A LATER record with no odometer must not hide the km baseline the
+    // earlier record gave (it used to flip the plan back to never_done).
     let wo2 = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO work_orders (id, vehicle_id, status, odometer_at_open, opened_at, created_by_user_id, updated_by_user_id)
-         VALUES ($1, $2, 'closed', NULL, now() + interval '1 hour', 1, 1)",
+         VALUES ($1, $2, 'open', NULL, now() + interval '1 hour', 1, 1)",
     )
     .bind(wo2)
     .bind(vid as i32)
@@ -944,10 +960,10 @@ async fn due_clock_ignores_undone_tasks_and_null_odometer_is_never_done() {
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(
+    assert_ne!(
         due_status(&pool, plan, vid).await,
         "never_done",
-        "latest record without km = no usable baseline for a mileage plan"
+        "the newest record WITH km stays the baseline"
     );
 }
 
@@ -1187,6 +1203,8 @@ async fn malformed_payload_is_a_per_op_error_not_a_crash() {
             operation: SyncOperation::Insert,
             payload: bad.clone(),
             sync_version: 0,
+            op_id: None,
+            group_id: None,
         };
         let (resp, _) = apply_push_batch(&pool, &PushBody { operations: vec![op] }, 1)
             .await
@@ -1263,7 +1281,7 @@ async fn nul_byte_in_a_string_field_is_a_per_op_error() {
         1,
     ).await.expect("NUL must not crash the batch");
     match &resp.results[0] {
-        PushResultStatus::Error { message, .. } => assert!(message.contains("NUL")),
+        PushResultStatus::Error { code, .. } => assert_eq!(code, "validation"),
         other => panic!("expected NUL per-op error, got {other:?}"),
     }
     assert!(matches!(resp.results[1], PushResultStatus::Applied { .. }), "clean op still applies");
@@ -1299,6 +1317,8 @@ async fn override_upserts_and_delete_is_refused() {
         operation: SyncOperation::Insert,
         payload: json!({"vehicle_id": vid, "odometer": odo, "set_at": chrono::Utc::now().to_rfc3339()}),
         sync_version: 0,
+        op_id: None,
+        group_id: None,
     };
     let (r, _) = apply_push_batch(&pool, &PushBody { operations: vec![ov(200_000)] }, 1).await.unwrap();
     assert!(matches!(r.results[0], PushResultStatus::Applied { .. }));
@@ -1311,7 +1331,7 @@ async fn override_upserts_and_delete_is_refused() {
     let (r, _) = apply_push_batch(&pool, &PushBody {
         operations: vec![delete_op(EntityType::VehicleOdometerOverrides, &vid.to_string(), sv)] }, 1).await.unwrap();
     match &r.results[0] {
-        PushResultStatus::Error { message, .. } => assert!(message.contains("does not support delete")),
+        PushResultStatus::Error { code, .. } => assert_eq!(code, "validation"),
         o => panic!("delete must be refused, got {o:?}"),
     }
 }
@@ -1362,7 +1382,7 @@ async fn update_missing_row_and_empty_patch_are_errors() {
     let ghost = Uuid::new_v4();
     let (r, _) = apply_push_batch(&pool, &PushBody {
         operations: vec![update_op(EntityType::WorkOrders, &ghost.to_string(), json!({"title": "x"}), 1)] }, 1).await.unwrap();
-    match &r.results[0] { PushResultStatus::Error { message, .. } => assert!(message.contains("row not found")), o => panic!("{o:?}") };
+    match &r.results[0] { PushResultStatus::Error { code, .. } => assert_eq!(code, "not_found"), o => panic!("{o:?}") };
 
     let wo = Uuid::new_v4();
     let (r, _) = apply_push_batch(&pool, &PushBody { operations: vec![wo_op(wo, "open")] }, 1).await.unwrap();
@@ -1381,11 +1401,12 @@ async fn record_debit_is_idempotent_on_ref_id() {
     sqlx::query("INSERT INTO oil_stock_cache (oil_type, liters_on_hand) VALUES ($1, 100) ON CONFLICT (oil_type) DO UPDATE SET liters_on_hand=100")
         .bind(&oil).execute(&pool).await.unwrap();
     let ref_id = Uuid::new_v4();
-    let spec = DebitSpec { kind: "oil_debit", brand: None, model: None, size: None,
-        oil_type: Some(oil.clone()), qty: None, liters: Some(40.0), ref_id, work_order_id: None };
+    let spec = Movement { kind: "oil_debit", brand: None, model: None, size: None,
+        oil_type: Some(oil.clone()), qty: None, liters: Some(40.0), ref_id, work_order_id: None,
+        user_id: Some(1), note: None };
     let mut tx = pool.begin().await.unwrap();
-    assert!(record_debit(&mut tx, &spec).await.unwrap(), "first debit records");
-    assert!(!record_debit(&mut tx, &spec).await.unwrap(), "second is a no-op");
+    assert!(record(&mut tx, &spec).await.unwrap(), "first debit records");
+    assert!(!record(&mut tx, &spec).await.unwrap(), "second is a no-op");
     tx.commit().await.unwrap();
     let (movements, left): (i64, f64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM stock_movements WHERE ref_id=$1), (SELECT liters_on_hand::float8 FROM oil_stock_cache WHERE oil_type=$2)")
