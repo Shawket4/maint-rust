@@ -1,0 +1,7 @@
+# Pinned: Rust 1.100 (2026-11-09) turned the never-type fallback lint into a
+# hard error, and sqlx-postgres 0.7.4 no longer compiles on it — which broke
+# every deploy from the day it shipped, because CI and the build container
+# both installed "stable". Raise this together with an sqlx upgrade (0.8+).
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"

@@ -40,7 +40,7 @@ jobs:
           MAINT_TEST_DATABASE_URL: postgres://maint:maint@127.0.0.1:5432/maint_test
           MAINT_REQUIRE_LIVE_TESTS: "1"
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo test --locked
 
@@ -71,7 +71,7 @@ jobs:
               ca-certificates \
               && rm -rf /var/lib/apt/lists/*
 
-          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           ENV PATH="/root/.cargo/bin:${PATH}"
 
           WORKDIR /app
