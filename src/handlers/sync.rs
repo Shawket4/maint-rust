@@ -1,4 +1,4 @@
-use actix_web::{get, post, web, HttpResponse};
+use actix_web::{get, post, web, HttpRequest, HttpResponse};
 use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 
@@ -31,13 +31,23 @@ async fn sync_push(
     Ok(HttpResponse::Ok().json(resp))
 }
 
+/// Streams that no longer exist. Garage apps from before they went still ask
+/// for them on every pull; an empty stream keeps those pulls (and the pushes
+/// queued behind them) working until the app is updated.
+const RETIRED_STREAMS: &[&str] = &["attendance_settings"];
+
 #[get("/sync/pull")]
 async fn sync_pull(
     pool: web::Data<PgPool>,
     claims: AuthClaims,
-    q: web::Query<PullQuery>,
+    req: HttpRequest,
 ) -> ApiResult<HttpResponse> {
     claims.require(level::USE, "syncing")?;
+    let raw = web::Query::<Vec<(String, String)>>::from_query(req.query_string()).map(|q| q.into_inner()).unwrap_or_default();
+    if raw.iter().any(|(k, v)| k == "entity_type" && RETIRED_STREAMS.contains(&v.as_str())) {
+        return Ok(HttpResponse::Ok().json(json!({ "rows": [], "has_more": false })));
+    }
+    let q = web::Query::<PullQuery>::from_query(req.query_string()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let since = q.since.unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
     let limit = q.limit.clamp(1, 1000);
     let resp: PullResponse =
