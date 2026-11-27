@@ -21,7 +21,7 @@ pub fn writable_columns(entity: EntityType) -> &'static [&'static str] {
             "opened_at", "closed_at", "notes_ar", "notes_en",
         ],
         EntityType::WorkOrderTasks => &[
-            "id", "work_order_id", "kind", "category_id",
+            "id", "work_order_id", "kind", "category_id", "category_name_ar",
             "description_ar", "description_en", "is_done", "done_at", "sort_order",
         ],
         EntityType::Tires => &[
