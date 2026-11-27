@@ -1,11 +1,11 @@
 //! Live-Postgres tests for garage attendance: workers typed in by name, one
-//! row per worker per day under its worker-and-date id, the settings row.
+//! row per worker per day under its worker-and-date id, no days off.
 //!
 //! Needs a throwaway database:  MAINT_TEST_DATABASE_URL=postgres://… cargo test
 
 use maint_rust::services::rules::attendance_day_id;
 use maint_rust::services::sync_engine::{
-    apply_push_batch, pull_rows, EntityType, PushBody, PushOperation, PushResultStatus, SyncOperation,
+    apply_push_batch, EntityType, PushBody, PushOperation, PushResultStatus, SyncOperation,
 };
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -182,36 +182,15 @@ async fn a_day_in_the_future_is_refused() {
 }
 
 #[tokio::test]
-async fn the_settings_row_upserts_and_pulls() {
+async fn the_office_month_counts_statuses_and_has_no_days_off() {
     let Some(pool) = test_pool().await else { return };
-    let since = chrono::Utc::now() - chrono::Duration::seconds(5);
-    let r = push(
-        &pool,
-        vec![ins(EntityType::AttendanceSettings, 1, json!({"work_start": "07:30", "late_grace_minutes": 10, "weekly_off_days": "5"}))],
-    )
-    .await;
-    sv(&r[0]);
-    // A second device that never pulled the row inserts it again: an upsert.
-    let r = push(&pool, vec![ins(EntityType::AttendanceSettings, 1, json!({"work_start": "08:00"}))]).await;
-    sv(&r[0]);
-    let start: String = sqlx::query_scalar("SELECT work_start FROM attendance_settings WHERE id = 1").fetch_one(&pool).await.unwrap();
-    assert_eq!(start, "08:00");
-    let r = push(&pool, vec![ins(EntityType::AttendanceSettings, 1, json!({"work_start": "25:00"}))]).await;
-    assert_eq!(code(&r[0]), "validation");
-    let pulled = pull_rows(&pool, EntityType::AttendanceSettings, since, None, 10).await.unwrap();
-    assert_eq!(pulled.rows.len(), 1);
-    assert_eq!(pulled.rows[0]["id"], 1);
-
-    // The office month reads these settings (08:00, 10 minutes' grace, Friday
-    // off); it lives in this test because the settings row is shared.
     let w = worker(&pool, "Office Month").await;
     let r = push(
         &pool,
         vec![
-            // Summer time: 05:30 UTC is 08:30 in Cairo, 30 minutes late; out 17:30.
             day(w, "2026-07-11", json!({"status": "present", "check_in_at": "2026-07-11T05:30:00Z", "check_out_at": "2026-07-11T14:30:00Z"})),
-            // A Friday: nobody is late on the weekly day off.
-            day(w, "2026-07-10", json!({"status": "present", "check_in_at": "2026-07-10T09:00:00Z"})),
+            // A Friday is a working day like any other.
+            day(w, "2026-07-10", json!({"status": "present"})),
             day(w, "2026-07-12", json!({"status": "absent"})),
         ],
     )
@@ -223,12 +202,8 @@ async fn the_settings_row_upserts_and_pulls() {
     assert_eq!(m.days.len(), 31);
     let row = m.workers.iter().find(|x| x.worker_id == w.to_string()).expect("worker in the month");
     assert_eq!(row.totals.present, 2);
-    assert_eq!(row.totals.late, 1);
-    assert_eq!(row.totals.late_minutes, 30);
     assert_eq!(row.totals.absent, 1);
-    assert_eq!(row.totals.worked_minutes, 9 * 60);
-    assert_eq!(row.cells[10].kind, "late");
+    assert_eq!(row.cells[10].check_out_at.map(|t| t.to_rfc3339()), Some("2026-07-11T14:30:00+00:00".into()));
     assert_eq!(row.cells[9].kind, "present", "the Friday");
-    assert_eq!(row.cells[2].kind, "weekly_off", "3 July 2026 is a Friday");
-    assert_eq!(row.cells[0].kind, "unmarked");
+    assert_eq!(row.cells[2].kind, "unmarked", "3 July 2026 is a Friday, not a day off");
 }

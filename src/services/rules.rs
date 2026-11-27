@@ -88,6 +88,9 @@ const TIMESTAMP_COLS: &[&str] = &[
 /// "<worker_id>:<YYYY-MM-DD>" in it. The garage app holds the same constant.
 pub const ATTENDANCE_DAY_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x510d161b_3155_4560_9a62_cd726bbed9e9);
 
+/// What a worker's day can be.
+pub const ATTENDANCE_STATUSES: &[&str] = &["present", "absent", "leave", "sick"];
+
 /// The one id a worker's day may have.
 pub fn attendance_day_id(worker_id: &uuid::Uuid, work_date: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(&ATTENDANCE_DAY_NAMESPACE, format!("{worker_id}:{work_date}").as_bytes())
@@ -184,7 +187,7 @@ fn normalize_worker(obj: &mut Map<String, Value>, is_insert: bool) -> Result<(),
 
 /// One row per worker per day, under the one id that day may have. The
 /// worker and the date never change after the row exists. Only a present day
-/// keeps its times.
+/// keeps its times. There is no "off": the garage has no days off.
 fn normalize_attendance_day(
     obj: &mut Map<String, Value>,
     row_before: Option<&Value>,
@@ -210,6 +213,12 @@ fn normalize_attendance_day(
                 }
             }
         }
+    }
+    match obj.get("status") {
+        Some(Value::String(s)) if ATTENDANCE_STATUSES.contains(&s.as_str()) => {}
+        Some(_) => return Err(format!("status must be one of {}", ATTENDANCE_STATUSES.join(", "))),
+        None if is_insert => return Err("status is required".into()),
+        None => {}
     }
     if let Some(status) = obj.get("status").and_then(Value::as_str) {
         if status != "present" {

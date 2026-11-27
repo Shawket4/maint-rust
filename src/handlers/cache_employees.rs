@@ -1,10 +1,11 @@
-//! Falcon's employees, for the garage's attendance list. Only the id, name,
-//! type and whether they are active leave this service: Falcon's employee
-//! rows also carry phone numbers, loans and credit balances, none of which
-//! the garage needs.
+//! Falcon's employees, for the garage's attendance list. Falcon's directory
+//! endpoint is open to every member of staff (permission 1) and carries only
+//! the id, name, type and whether they are active; the full employee rows
+//! (phone numbers, loans, credit balances) stay at permission 3. The same
+//! four fields are projected here as well.
 //!
-//! Falcon lists employees at permission 3. A lower token gets an empty list
-//! with `available: false`; the garage can still type workers in by name.
+//! A token Falcon still refuses gets an empty list with `available: false`;
+//! the garage can always type workers in by name.
 
 use actix_web::{get, web, HttpResponse};
 use serde_json::{json, Value};
@@ -13,7 +14,7 @@ use crate::auth::middleware::BearerToken;
 use crate::error::{ApiError, ApiResult};
 use crate::handlers::AppState;
 
-pub const FALCON_EMPLOYEES_PATH: &str = "/api/employees";
+pub const FALCON_EMPLOYEES_PATH: &str = "/api/employee-directory";
 
 /// Falcon's employees, scrubbed and sorted by name.
 pub fn project_employees(raw: &Value) -> Vec<Value> {
@@ -42,7 +43,7 @@ pub fn project_employees(raw: &Value) -> Vec<Value> {
 async fn get_cache_employees(state: web::Data<AppState>, token: BearerToken) -> ApiResult<HttpResponse> {
     match state.falcon.get_json(FALCON_EMPLOYEES_PATH, &token.0).await {
         Ok(raw) => Ok(HttpResponse::Ok().json(json!({ "employees": project_employees(&raw), "available": true }))),
-        // Falcon refuses a token below permission 3: not an error for the garage.
+        // Falcon refuses the token: not an error for the garage.
         Err(ApiError::UpstreamFalcon { status: 403, .. }) => {
             Ok(HttpResponse::Ok().json(json!({ "employees": [], "available": false })))
         }
