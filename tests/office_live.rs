@@ -338,6 +338,83 @@ async fn the_office_reads_work_orders_and_a_trucks_maintenance() {
 }
 
 #[actix_web::test]
+async fn the_car_page_gets_everything_the_garage_records_about_each_tire() {
+    let Some((pool, _)) = test_pool().await else { return };
+    let app = app!(pool);
+    let get = |uri: String, user_type: &'static str| test::TestRequest::get().uri(&uri).insert_header(bearer(1, user_type)).to_request();
+    let car = fresh_vehicle();
+    sqlx::query("INSERT INTO vehicles_cache (id, car_no_plate, last_fuel_odometer, raw_payload, fetched_at) VALUES ($1, $2, 104000, '{}'::jsonb, now())")
+        .bind(car)
+        .bind(format!("OFF {car}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (layout, axle, outer, inner, tire, wo) =
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let exec = |sql: &'static str| sqlx::query(sql);
+    exec("INSERT INTO chassis_layouts (id, vehicle_id, created_by_user_id, updated_by_user_id) VALUES ($1, $2, 1, 1)")
+        .bind(layout).bind(car).execute(&pool).await.unwrap();
+    // A lifted trailer axle with dual wheels.
+    exec("INSERT INTO chassis_axles (id, layout_id, section, section_index, axle_type, is_steering, is_lifted, created_by_user_id, updated_by_user_id)
+          VALUES ($1, $2, 'trailer', 1, 'dual', false, true, 1, 1)")
+        .bind(axle).bind(layout).execute(&pool).await.unwrap();
+    for (pos, depth, code) in [(outer, "outer", "TR1LO"), (inner, "inner", "TR1LI")] {
+        sqlx::query("INSERT INTO chassis_positions (id, layout_id, axle_id, side, depth, is_spare, position_code, created_by_user_id, updated_by_user_id)
+                     VALUES ($1, $2, $3, 'left', $4::position_depth, false, $5, 1, 1)")
+            .bind(pos).bind(layout).bind(axle).bind(depth).bind(code).execute(&pool).await.unwrap();
+    }
+    exec("INSERT INTO work_orders (id, vehicle_id, status, opened_at, created_by_user_id, updated_by_user_id) VALUES ($1, $2, 'open', now(), 1, 1)")
+        .bind(wo).bind(car).execute(&pool).await.unwrap();
+    exec("INSERT INTO tires (id, dot_code, brand, model, size, status, origin, total_km, notes_ar, created_by_user_id, updated_by_user_id)
+          VALUES ($1, '2324', 'Pirelli', 'FR85', '315/80 R22.5', 'mounted', 'legacy', 1000, 'جات مستعملة', 1, 1)")
+        .bind(tire).execute(&pool).await.unwrap();
+    // It ran 10,000 km on the inner wheel, then moved to the outer one.
+    exec("INSERT INTO tire_assignments (tire_id, position_id, vehicle_id, mounted_at, mounted_odometer, mount_reason,
+                                        dismounted_at, dismounted_odometer, dismount_reason, created_by_user_id, updated_by_user_id)
+          VALUES ($1, $2, $3, now() - interval '30 days', 90000, 'onboard', now() - interval '10 days', 100000, 'rotation', 1, 1)")
+        .bind(tire).bind(inner).bind(car).execute(&pool).await.unwrap();
+    exec("INSERT INTO tire_assignments (tire_id, position_id, vehicle_id, work_order_id, mounted_at, mounted_odometer, mount_reason, notes,
+                                        created_by_user_id, updated_by_user_id)
+          VALUES ($1, $2, $3, $4, now() - interval '10 days', 100000, 'rotation', 'اتبدلت مع الجوانية', 1, 1)")
+        .bind(tire).bind(outer).bind(car).bind(wo).execute(&pool).await.unwrap();
+    exec("INSERT INTO tire_status_events (tire_id, event_type, from_status, to_status, notes, occurred_at, created_by_user_id, updated_by_user_id)
+          VALUES ($1, 'repair_in', 'in_repair', 'in_stock_used', 'رجعت من البنشر', now() - interval '20 days', 1, 1)")
+        .bind(tire).execute(&pool).await.unwrap();
+
+    let m: Value = test::call_and_read_body_json(&app, get(format!("/api/maint/office/vehicles/{car}/maintenance"), "admin_user")).await;
+    let tires = m["tires"].as_array().unwrap();
+    assert_eq!(tires.len(), 2);
+    let on = tires.iter().find(|p| p["position_code"] == "TR1LO").unwrap();
+    // The wheel: its axle, lifted.
+    assert_eq!((on["axle_id"].as_str(), on["is_lifted"].as_bool()), (Some(axle.to_string().as_str()), Some(true)));
+    // The tire itself.
+    assert_eq!(on["tire_id"], tire.to_string());
+    assert_eq!((on["dot_code"].as_str(), on["brand"].as_str(), on["model"].as_str()), (Some("2324"), Some("Pirelli"), Some("FR85")));
+    assert_eq!((on["status"].as_str(), on["origin"].as_str(), on["retread_count"].as_i64()), (Some("mounted"), Some("legacy"), Some(0)));
+    assert_eq!((on["base_km"].as_i64(), on["notes"].as_str()), (Some(1000), Some("جات مستعملة")));
+    assert!(on["registered_at"].is_string());
+    // This fitting: when, at what km, why, on which work order, km since.
+    assert_eq!((on["mounted_odometer"].as_i64(), on["mount_reason"].as_str()), (Some(100000), Some("rotation")));
+    assert_eq!(on["mount_notes"], "اتبدلت مع الجوانية");
+    assert_eq!(on["mounted_work_order_id"], wo.to_string());
+    assert_eq!(on["km_this_mount"], 4000);
+    assert_eq!(on["total_km"], 1000 + 10000 + 4000);
+    assert_eq!(on["km_incomplete"], false);
+    // Its earlier fittings and status changes.
+    let past = on["past_mounts"].as_array().unwrap();
+    assert_eq!(past.len(), 1);
+    assert_eq!((past[0]["position_code"].as_str(), past[0]["km_run"].as_i64()), (Some("TR1LI"), Some(10000)));
+    assert_eq!((past[0]["dismount_reason"].as_str(), past[0]["plate"].as_str()), (Some("rotation"), Some(format!("OFF {car}").as_str())));
+    assert_eq!(on["events"][0]["event_type"], "repair_in");
+    assert_eq!(on["events"][0]["notes"], "رجعت من البنشر");
+    // An empty wheel: its axle, nothing about a tire.
+    let empty = tires.iter().find(|p| p["position_code"] == "TR1LI").unwrap();
+    assert_eq!(empty["is_lifted"], true);
+    assert!(empty["tire_id"].is_null() && empty["dot_code"].is_null() && empty["km_this_mount"].is_null());
+    assert_eq!((empty["past_mounts"].as_array().map(Vec::len), empty["km_incomplete"].as_bool()), (Some(0), Some(false)));
+}
+
+#[actix_web::test]
 async fn a_stock_count_brings_the_book_to_the_shelf_and_names_who_did_it() {
     let Some((pool, _)) = test_pool().await else { return };
     let app = app!(pool);

@@ -203,18 +203,54 @@ async fn vehicle_maintenance(pool: web::Data<PgPool>, path: web::Path<i32>) -> A
     .bind(id)
     .fetch_one(pool.get_ref())
     .await?;
+    // One row per wheel position, with everything the garage records about
+    // the tire on it: the tire itself, this fitting, and its earlier ones.
     let (tires,): (Value,) = sqlx::query_as(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
                     'position_id', p.id, 'position_code', p.position_code, 'is_spare', p.is_spare, 'spare_index', p.spare_index,
                     'side', p.side::text, 'depth', p.depth::text,
-                    'section', x.section::text, 'axle_index', x.section_index, 'is_steering', x.is_steering,
+                    'axle_id', x.id, 'section', x.section::text, 'axle_index', x.section_index, 'is_steering', x.is_steering,
+                    'is_lifted', x.is_lifted,
                     'tire_id', t.id, 'brand', t.brand, 'model', t.model, 'size', t.size, 'dot_code', t.dot_code,
-                    'total_km', t.total_km, 'mounted_at', t.mounted_at)
+                    'total_km', t.total_km, 'mounted_at', t.mounted_at,
+                    'status', t.status::text, 'origin', t.origin::text, 'retread_count', t.retread_count,
+                    'base_km', tb.total_km, 'notes', t.notes_ar, 'registered_at', t.created_at,
+                    'mounted_odometer', ta.mounted_odometer, 'mount_reason', ta.mount_reason::text,
+                    'mount_notes', ta.notes, 'mounted_work_order_id', ta.work_order_id,
+                    'km_this_mount', CASE WHEN ta.mounted_odometer IS NOT NULL AND NOT p.is_spare
+                                               AND odo.current_odometer > ta.mounted_odometer
+                                          THEN odo.current_odometer - ta.mounted_odometer END,
+                    'km_incomplete', t.id IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM tire_assignments m LEFT JOIN chassis_positions mp ON mp.id = m.position_id
+                         WHERE m.tire_id = t.id AND m.deleted_at IS NULL AND NOT COALESCE(mp.is_spare, false)
+                           AND (m.mounted_odometer IS NULL OR (m.dismounted_at IS NOT NULL AND m.dismounted_odometer IS NULL))),
+                    'past_mounts', CASE WHEN t.id IS NULL THEN '[]'::jsonb ELSE (
+                        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                                   'vehicle_id', m.vehicle_id, 'plate', mv.car_no_plate, 'position_code', mp.position_code,
+                                   'mounted_at', m.mounted_at, 'mounted_odometer', m.mounted_odometer, 'mount_reason', m.mount_reason::text,
+                                   'dismounted_at', m.dismounted_at, 'dismounted_odometer', m.dismounted_odometer,
+                                   'dismount_reason', m.dismount_reason::text,
+                                   'km_run', CASE WHEN m.dismounted_odometer > m.mounted_odometer AND NOT COALESCE(mp.is_spare, false)
+                                                  THEN m.dismounted_odometer - m.mounted_odometer END)
+                                 ORDER BY m.mounted_at DESC), '[]'::jsonb)
+                          FROM tire_assignments m
+                          LEFT JOIN chassis_positions mp ON mp.id = m.position_id
+                          LEFT JOIN vehicles_cache mv ON mv.id = m.vehicle_id
+                         WHERE m.tire_id = t.id AND m.deleted_at IS NULL AND m.dismounted_at IS NOT NULL) END,
+                    'events', CASE WHEN t.id IS NULL THEN '[]'::jsonb ELSE (
+                        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                                   'event_type', e.event_type::text, 'from_status', e.from_status::text, 'to_status', e.to_status::text,
+                                   'notes', e.notes, 'occurred_at', e.occurred_at)
+                                 ORDER BY e.occurred_at DESC), '[]'::jsonb)
+                          FROM tire_status_events e WHERE e.tire_id = t.id AND e.deleted_at IS NULL) END)
                   ORDER BY p.is_spare, (x.section = 'trailer'), x.section_index, p.side, p.depth, p.spare_index), '[]'::jsonb)
            FROM chassis_layouts l
            JOIN chassis_positions p ON p.layout_id = l.id AND p.deleted_at IS NULL
            LEFT JOIN chassis_axles x ON x.id = p.axle_id
            LEFT JOIN v_tires_list t ON t.mounted_position_id = p.id
+           LEFT JOIN tire_assignments ta ON ta.tire_id = t.id AND ta.dismounted_at IS NULL AND ta.deleted_at IS NULL
+           LEFT JOIN tires tb ON tb.id = t.id
+           LEFT JOIN v_current_odometer odo ON odo.vehicle_id = l.vehicle_id
           WHERE l.vehicle_id = $1 AND l.deleted_at IS NULL",
     )
     .bind(id)
