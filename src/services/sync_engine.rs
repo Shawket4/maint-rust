@@ -46,7 +46,6 @@ pub enum EntityType {
     VehicleOdometerOverrides,
     AttendanceWorkers,
     AttendanceDays,
-    AttendanceSettings,
 }
 
 impl EntityType {
@@ -65,7 +64,6 @@ impl EntityType {
             Self::VehicleOdometerOverrides => "vehicle_odometer_overrides",
             Self::AttendanceWorkers => "attendance_workers",
             Self::AttendanceDays => "attendance_days",
-            Self::AttendanceSettings => "attendance_settings",
         }
     }
 
@@ -87,10 +85,9 @@ impl EntityType {
         }
     }
 
-    /// Integer-keyed singletons (one row per vehicle, or the one settings
-    /// row): an insert upserts.
+    /// Integer-keyed singletons (one row per vehicle): an insert upserts.
     pub fn is_singleton(self) -> bool {
-        matches!(self, Self::VehicleClassAssignments | Self::VehicleOdometerOverrides | Self::AttendanceSettings)
+        matches!(self, Self::VehicleClassAssignments | Self::VehicleOdometerOverrides)
     }
 
     /// Every owned table soft-deletes except the odometer override.

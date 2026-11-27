@@ -63,9 +63,6 @@ pub fn writable_columns(entity: EntityType) -> &'static [&'static str] {
         EntityType::AttendanceDays => &[
             "id", "worker_id", "work_date", "status", "check_in_at", "check_out_at", "note",
         ],
-        EntityType::AttendanceSettings => &[
-            "id", "work_start", "work_end", "late_grace_minutes", "weekly_off_days",
-        ],
     }
 }
 
@@ -88,8 +85,6 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (EntityType::ChassisPositions, "side") => "::position_side",
         (EntityType::ChassisPositions, "depth") => "::position_depth",
         (EntityType::AttendanceDays, "status") => "::attendance_status",
-        // The settings row is keyed by an integer, not a UUID.
-        (EntityType::AttendanceSettings, "id") => "::integer",
         // UUID-typed PKs and FKs need an explicit cast when extracted via ->>
         (_, "id") if entity.pk_column() == "id" => "::uuid",
         (_, "work_order_id") => "::uuid",
@@ -107,7 +102,7 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (_, "total_km") | (_, "section_index") | (_, "spare_index") |
         (_, "sort_order") | (_, "mounted_odometer") | (_, "dismounted_odometer") |
         (_, "retread_count") | (_, "superseded_km") |
-        (_, "falcon_employee_id") | (_, "late_grace_minutes") => "::integer",
+        (_, "falcon_employee_id") => "::integer",
         // Numeric/Decimal columns
         (_, "liters") => "::numeric",
         // Timestamptz columns
