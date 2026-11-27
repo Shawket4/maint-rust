@@ -197,11 +197,12 @@ async fn batteries_are_counted_on_the_shelf_fitted_into_slots_and_taken_off_with
         "id": refit, "battery_id": battery, "vehicle_id": vid, "slot": 1}), 0)]).await;
     assert_eq!(code(&r[0]), "applied");
     assert_eq!(status(&pool, battery).await, "installed");
-    // Undoing that fitting puts it back where its last removal left it.
+    // Undoing that fitting puts it back in stock, where it was fitted from —
+    // not where its last removal sent it (it has come back from warranty since).
     let r = push(&pool, vec![op(EntityType::BatteryInstalls, SyncOperation::Delete, &refit.to_string(), json!({}),
         sv(&pool, "battery_installs", refit).await)]).await;
     assert_eq!(code(&r[0]), "applied");
-    assert_eq!(status(&pool, battery).await, "warranty");
+    assert_eq!(status(&pool, battery).await, "in_stock_used");
     // A removal with no outcome or reason: back in stock as used, reason other.
     let r = push(&pool, vec![op(EntityType::BatteryInstalls, SyncOperation::Update, &legacy_install.to_string(), json!({
         "removed_at": chrono::Utc::now().to_rfc3339()}), sv(&pool, "battery_installs", legacy_install).await)]).await;
@@ -249,7 +250,7 @@ async fn batteries_are_counted_on_the_shelf_fitted_into_slots_and_taken_off_with
     )
     .await;
     assert_eq!(list["total"], 1);
-    assert_eq!(list["rows"][0]["status"], "warranty");
+    assert_eq!(list["rows"][0]["status"], "in_stock_used");
     let moves: Vec<Value> = test::call_and_read_body_json(
         &app,
         test::TestRequest::get().uri("/api/maint/stock/movements?kind=battery&limit=200").insert_header(bearer(1)).to_request(),

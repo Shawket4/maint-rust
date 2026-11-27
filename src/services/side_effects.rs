@@ -635,8 +635,16 @@ pub async fn after_apply(
             }
         }
         (EntityType::BatteryInstalls, SyncOperation::Delete) => {
-            if let Some(battery_id) = row_before.and_then(|r| uuid_at(r, "battery_id")) {
-                rederive_battery_status(tx, battery_id).await?;
+            if let Some(before) = row_before {
+                if let Some(battery_id) = uuid_at(before, "battery_id") {
+                    // An undone fitting puts the battery back where a fitting
+                    // can only have taken it from: in stock, used. (Its last
+                    // removal may say "charging" — it was charged since.)
+                    if before.get("removed_at").map(Value::is_null).unwrap_or(true) {
+                        set_battery_status(tx, battery_id, "in_stock_used").await?;
+                    }
+                    rederive_battery_status(tx, battery_id).await?;
+                }
             }
         }
 
