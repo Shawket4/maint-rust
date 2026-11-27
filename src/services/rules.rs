@@ -32,6 +32,7 @@ pub mod codes {
     pub const CHASSIS_IN_USE: &str = "chassis_in_use";
     pub const WORK_ORDER_NOT_EMPTY: &str = "work_order_not_empty";
     pub const DUPLICATE: &str = "duplicate";
+    pub const WORKER_HAS_DAYS: &str = "worker_has_days";
 }
 
 pub const OIL_FLAG_MIN: f64 = 34.0;

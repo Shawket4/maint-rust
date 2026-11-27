@@ -162,6 +162,18 @@ async fn only_a_present_day_keeps_times_and_out_comes_after_in() {
 }
 
 #[tokio::test]
+async fn a_worker_with_marked_days_is_not_deleted() {
+    let Some(pool) = test_pool().await else { return };
+    let w = worker(&pool, "Has Days").await;
+    sv(&push(&pool, vec![day(w, PAST, json!({"status": "absent"}))]).await[0]);
+    let r = push(&pool, vec![op(EntityType::AttendanceWorkers, w, SyncOperation::Delete, json!({}), 1)]).await;
+    assert_eq!(code(&r[0]), "worker_has_days");
+    let typo = worker(&pool, "Typo").await;
+    let r = push(&pool, vec![op(EntityType::AttendanceWorkers, typo, SyncOperation::Delete, json!({}), 1)]).await;
+    sv(&r[0]);
+}
+
+#[tokio::test]
 async fn a_day_in_the_future_is_refused() {
     let Some(pool) = test_pool().await else { return };
     let w = worker(&pool, "Future").await;
