@@ -120,8 +120,8 @@ async fn a_task_that_is_a_standard_job_is_linked_and_a_sentence_is_not() {
     let (t1, t2) = (Uuid::new_v4(), Uuid::new_v4());
     push(&pool, vec![
         ins(EntityType::WorkOrders, wo, json!({"vehicle_id": 4_100_000, "status": "open"})),
-        // "تغيير زيت" is seeded from the maintenance types; typed with a hamza variant and spaces.
-        ins(EntityType::WorkOrderTasks, t1, json!({"work_order_id": wo, "kind": "free", "description_ar": " تغيير  زيت "})),
+        // A seeded job of the oil change, typed with extra spaces.
+        ins(EntityType::WorkOrderTasks, t1, json!({"work_order_id": wo, "kind": "free", "description_ar": " تغيير  زيت  موتور "})),
         ins(EntityType::WorkOrderTasks, t2, json!({"work_order_id": wo, "kind": "free", "description_ar": "السواق بيقول فيه صوت في الفرامل"})),
     ]).await;
     let job: Option<Uuid> = sqlx::query_scalar("SELECT standard_job_id FROM work_order_tasks WHERE id = $1").bind(t1).fetch_one(&pool).await.unwrap();
@@ -129,6 +129,51 @@ async fn a_task_that_is_a_standard_job_is_linked_and_a_sentence_is_not() {
     assert_eq!(cat.as_deref(), Some("oil_change"));
     let none: Option<Uuid> = sqlx::query_scalar("SELECT standard_job_id FROM work_order_tasks WHERE id = $1").bind(t2).fetch_one(&pool).await.unwrap();
     assert!(none.is_none(), "free text stays free text");
+}
+
+#[tokio::test]
+async fn a_type_holds_its_jobs_and_typed_types_and_jobs_are_kept() {
+    let Some(pool) = test_pool().await else { return };
+    // The old one-per-type job left the list; the type's own jobs are there.
+    let jobs: Vec<String> = sqlx::query_scalar(
+        "SELECT name_ar FROM standard_jobs WHERE category_id = 'greasing' AND is_active ORDER BY name_ar",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(jobs.contains(&"تشحيم صنيه".to_string()) && jobs.contains(&"تشحيم بلي (الاجناب)".to_string()), "{jobs:?}");
+    assert!(!jobs.contains(&"تشحيم".to_string()));
+
+    let wo = Uuid::new_v4();
+    let t = tag();
+    let (new_type, typed_job, same_name, only_type) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let cid = format!("c-{t}");
+    let r = push(&pool, vec![
+        ins(EntityType::WorkOrders, wo, json!({"vehicle_id": 4_100_001, "status": "open"})),
+        // A type nobody has: created from the task that names it.
+        ins(EntityType::WorkOrderTasks, new_type, json!({"work_order_id": wo, "kind": "free", "category_id": cid, "category_name_ar": format!("كهربا {t}"), "description_ar": format!("تغيير لمبة {t}")})),
+        // A job typed under an existing type joins its jobs.
+        ins(EntityType::WorkOrderTasks, typed_job, json!({"work_order_id": wo, "kind": "free", "category_id": "greasing", "description_ar": format!("تشحيم كرنك {t}")})),
+        // A typed type an existing type already has is that type.
+        ins(EntityType::WorkOrderTasks, same_name, json!({"work_order_id": wo, "kind": "free", "category_id": format!("c-x{t}"), "category_name_ar": " تشحيم ", "description_ar": "تشحيم صنيه"})),
+        // Only a type: its name is not a job of its own.
+        ins(EntityType::WorkOrderTasks, only_type, json!({"work_order_id": wo, "kind": "free", "category_id": "battery", "description_ar": "بطارية"})),
+    ]).await;
+    for x in &r {
+        assert!(matches!(x, PushResultStatus::Applied { .. }), "{x:?}");
+    }
+    let name: String = sqlx::query_scalar("SELECT name_ar FROM maintenance_categories WHERE id = $1").bind(&cid).fetch_one(&pool).await.unwrap();
+    assert_eq!(name, format!("كهربا {t}"));
+    let job_cat: Option<String> = sqlx::query_scalar("SELECT category_id FROM standard_jobs WHERE norm_key = maint_norm($1)")
+        .bind(format!("تغيير لمبة {t}")).fetch_one(&pool).await.unwrap();
+    assert_eq!(job_cat.as_deref(), Some(cid.as_str()));
+    let job_cat: Option<String> = sqlx::query_scalar("SELECT category_id FROM standard_jobs WHERE norm_key = maint_norm($1)")
+        .bind(format!("تشحيم كرنك {t}")).fetch_one(&pool).await.unwrap();
+    assert_eq!(job_cat.as_deref(), Some("greasing"));
+    let cat: Option<String> = sqlx::query_scalar("SELECT category_id FROM work_order_tasks WHERE id = $1").bind(same_name).fetch_one(&pool).await.unwrap();
+    assert_eq!(cat.as_deref(), Some("greasing"));
+    let active: bool = sqlx::query_scalar("SELECT is_active FROM standard_jobs WHERE norm_key = maint_norm('بطارية')").fetch_one(&pool).await.unwrap();
+    assert!(!active, "the type's own name stays off the list");
 }
 
 #[tokio::test]
