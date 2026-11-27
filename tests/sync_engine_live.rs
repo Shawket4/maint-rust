@@ -992,6 +992,9 @@ fn entity_vocabulary_round_trips_as_snake_case() {
         (EntityType::Tires, "tires"),
         (EntityType::TireAssignments, "tire_assignments"),
         (EntityType::TireStatusEvents, "tire_status_events"),
+        (EntityType::BatteryLayouts, "battery_layouts"),
+        (EntityType::Batteries, "batteries"),
+        (EntityType::BatteryInstalls, "battery_installs"),
     ];
     for (variant, wire) in expect {
         let ser = serde_json::to_string(&variant).unwrap();
@@ -1413,7 +1416,7 @@ async fn record_debit_is_idempotent_on_ref_id() {
     let ref_id = Uuid::new_v4();
     let spec = Movement { kind: "oil_debit", brand: None, model: None, size: None,
         oil_type: Some(oil.clone()), qty: None, liters: Some(40.0), ref_id, work_order_id: None,
-        user_id: Some(1), note: None };
+        user_id: Some(1), note: None, battery_product_id: None };
     let mut tx = pool.begin().await.unwrap();
     assert!(record(&mut tx, &spec).await.unwrap(), "first debit records");
     assert!(!record(&mut tx, &spec).await.unwrap(), "second is a no-op");

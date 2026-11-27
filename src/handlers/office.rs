@@ -26,15 +26,15 @@ const WO_ROW: &str = "jsonb_build_object(
     'summary_en', (SELECT string_agg(COALESCE(NULLIF(btrim(t.description_en), ''), j.name_en, c.name_en, NULLIF(btrim(t.description_ar), '')), ', ' ORDER BY t.sort_order)
                   FROM work_order_tasks t LEFT JOIN maintenance_categories c ON c.id = t.category_id
                   LEFT JOIN standard_jobs j ON j.id = t.standard_job_id
-                 WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind <> 'oil'),
-    'task_count', (SELECT COUNT(*) FROM work_order_tasks t WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind <> 'oil'),
-    'done_count', (SELECT COUNT(*) FROM work_order_tasks t WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind <> 'oil' AND t.is_done),
+                 WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind NOT IN ('oil', 'battery')),
+    'task_count', (SELECT COUNT(*) FROM work_order_tasks t WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind NOT IN ('oil', 'battery')),
+    'done_count', (SELECT COUNT(*) FROM work_order_tasks t WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind NOT IN ('oil', 'battery') AND t.is_done),
     'oil_liters', (SELECT SUM(o.liters)::float8 FROM oil_changes o WHERE o.work_order_id = w.id AND o.deleted_at IS NULL),
     'tire_ops', (SELECT COUNT(*) FROM tire_assignments a
                   WHERE (a.work_order_id = w.id OR a.dismount_work_order_id = w.id) AND a.deleted_at IS NULL),
     'summary', (SELECT string_agg(COALESCE(NULLIF(btrim(t.description_ar), ''), c.name_ar), '، ' ORDER BY t.sort_order)
                   FROM work_order_tasks t LEFT JOIN maintenance_categories c ON c.id = t.category_id
-                 WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind <> 'oil'))";
+                 WHERE t.work_order_id = w.id AND t.deleted_at IS NULL AND t.kind NOT IN ('oil', 'battery')))";
 
 #[derive(Debug, Deserialize)]
 struct WoListQuery {
@@ -131,7 +131,7 @@ async fn get_work_order(pool: web::Data<PgPool>, path: web::Path<Uuid>) -> ApiRe
                     'is_done', t.is_done, 'done_at', t.done_at) ORDER BY t.sort_order, t.created_at), '[]'::jsonb)
            FROM work_order_tasks t LEFT JOIN maintenance_categories c ON c.id = t.category_id
            LEFT JOIN standard_jobs j ON j.id = t.standard_job_id
-          WHERE t.work_order_id = $1 AND t.deleted_at IS NULL AND t.kind <> 'oil'",
+          WHERE t.work_order_id = $1 AND t.deleted_at IS NULL AND t.kind NOT IN ('oil', 'battery')",
     )
     .bind(id)
     .fetch_one(pool.get_ref())
@@ -256,11 +256,54 @@ async fn vehicle_maintenance(pool: web::Data<PgPool>, path: web::Path<i32>) -> A
     .bind(id)
     .fetch_one(pool.get_ref())
     .await?;
+    let (batteries,): (Value,) = sqlx::query_as(&format!(
+        "WITH fitted AS (
+            SELECT i.*, {BATTERY_JSON} AS battery
+              FROM battery_installs i JOIN batteries b ON b.id = i.battery_id
+             WHERE i.vehicle_id = $1 AND i.deleted_at IS NULL AND i.removed_at IS NULL AND b.deleted_at IS NULL),
+         removed AS (
+            SELECT i.*, {BATTERY_JSON} AS battery
+              FROM battery_installs i JOIN batteries b ON b.id = i.battery_id
+             WHERE i.vehicle_id = $1 AND i.deleted_at IS NULL AND i.removed_at IS NOT NULL
+             ORDER BY i.removed_at DESC LIMIT 20)
+         SELECT jsonb_build_object(
+            'slots', GREATEST(COALESCE((SELECT l.slots FROM battery_layouts l WHERE l.vehicle_id = $1 AND l.deleted_at IS NULL), 2),
+                              COALESCE((SELECT MAX(slot) FROM fitted), 0)),
+            'fitted', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                    'install_id', f.id, 'slot', f.slot, 'battery', f.battery,
+                    'installed_at', f.installed_at, 'installed_odometer', f.installed_odometer,
+                    'work_order_id', f.work_order_id, 'notes', f.notes,
+                    'km_this_install', CASE WHEN f.installed_odometer IS NOT NULL AND odo.current_odometer > f.installed_odometer
+                                            THEN odo.current_odometer - f.installed_odometer END)
+                  ORDER BY f.slot) FROM fitted f LEFT JOIN v_current_odometer odo ON odo.vehicle_id = $1), '[]'::jsonb),
+            'removed', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                    'install_id', r.id, 'slot', r.slot, 'battery', r.battery,
+                    'installed_at', r.installed_at, 'installed_odometer', r.installed_odometer,
+                    'removed_at', r.removed_at, 'removed_odometer', r.removed_odometer,
+                    'removal_reason', r.removal_reason::text, 'removal_outcome', r.removal_outcome::text,
+                    'work_order_id', r.work_order_id, 'removal_work_order_id', r.removal_work_order_id, 'notes', r.notes,
+                    'km_run', CASE WHEN r.removed_odometer > r.installed_odometer THEN r.removed_odometer - r.installed_odometer END)
+                  ORDER BY r.removed_at DESC) FROM removed r), '[]'::jsonb))"
+    ))
+    .bind(id)
+    .fetch_one(pool.get_ref())
+    .await?;
     Ok(HttpResponse::Ok().json(json!({
         "vehicle_id": id, "odometer": odometer, "class": class,
         "open_work_orders": open, "recent_work_orders": recent, "due": due, "tires": tires,
+        "batteries": batteries,
     })))
 }
+
+/// One battery as the office reads it (aliased `b`): what it is, its warranty
+/// (counted from its first fitting). A jsonb expression.
+const BATTERY_JSON: &str = "jsonb_build_object(
+    'id', b.id, 'brand', b.brand, 'model', b.model, 'capacity_ah', b.capacity_ah, 'voltage', b.voltage,
+    'cca', b.cca, 'serial', b.serial, 'date_code', b.date_code, 'warranty_months', b.warranty_months,
+    'status', b.status::text, 'origin', b.origin::text, 'notes', b.notes_ar, 'registered_at', b.created_at,
+    'first_installed_at', (SELECT MIN(x.installed_at) FROM battery_installs x WHERE x.battery_id = b.id AND x.deleted_at IS NULL),
+    'warranty_until', (SELECT MIN(x.installed_at) FROM battery_installs x WHERE x.battery_id = b.id AND x.deleted_at IS NULL)
+                      + make_interval(months => b.warranty_months))";
 
 #[derive(Debug, Deserialize)]
 struct TireListQuery {
@@ -289,6 +332,37 @@ async fn list_tires(pool: web::Data<PgPool>, q: web::Query<TireListQuery>) -> Ap
                    FROM v_tires_list t LEFT JOIN vehicles_cache v ON v.id = t.mounted_vehicle_id
                   WHERE {filter}
                   ORDER BY (t.status = 'mounted') DESC, v.car_no_plate, t.mounted_position_code, t.brand, t.id
+                  LIMIT $3 OFFSET $4) r"
+    );
+    let (rows, total, counts): (Value, i64, Value) = sqlx::query_as(&sql)
+        .bind(q.status.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(limit)
+        .bind(offset)
+        .fetch_one(pool.get_ref())
+        .await?;
+    Ok(HttpResponse::Ok().json(json!({ "rows": rows, "total": total, "status_counts": counts })))
+}
+
+/// Every battery: what it is, where it is now (truck and slot), its warranty.
+#[get("/office/batteries")]
+async fn list_batteries(pool: web::Data<PgPool>, q: web::Query<TireListQuery>) -> ApiResult<HttpResponse> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let filter = "b.deleted_at IS NULL AND ($1::text IS NULL OR b.status::text = $1)
+        AND ($2::text IS NULL OR maint_norm(concat_ws(' ', b.brand, b.model, b.serial, b.date_code, v.car_no_plate)) LIKE '%' || maint_norm($2) || '%')";
+    let from = "batteries b
+        LEFT JOIN battery_installs i ON i.battery_id = b.id AND i.removed_at IS NULL AND i.deleted_at IS NULL
+        LEFT JOIN vehicles_cache v ON v.id = i.vehicle_id";
+    let sql = format!(
+        "SELECT COALESCE(jsonb_agg(r.row), '[]'::jsonb),
+                (SELECT COUNT(*) FROM {from} WHERE {filter}),
+                (SELECT COALESCE(jsonb_object_agg(s.status, s.n), '{{}}'::jsonb) FROM (SELECT status::text, COUNT(*) AS n FROM batteries WHERE deleted_at IS NULL GROUP BY 1) s)
+           FROM (SELECT {BATTERY_JSON} || jsonb_build_object('vehicle_id', i.vehicle_id, 'plate', v.car_no_plate,
+                                                             'slot', i.slot, 'installed_at', i.installed_at) AS row
+                   FROM {from}
+                  WHERE {filter}
+                  ORDER BY (b.status = 'installed') DESC, v.car_no_plate, i.slot, b.brand, b.id
                   LIMIT $3 OFFSET $4) r"
     );
     let (rows, total, counts): (Value, i64, Value) = sqlx::query_as(&sql)
@@ -405,6 +479,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(get_work_order)
         .service(vehicle_maintenance)
         .service(list_tires)
+        .service(list_batteries)
         .service(legacy_events)
         .service(legacy_unmatched)
         .service(legacy_decide)

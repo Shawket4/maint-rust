@@ -21,7 +21,7 @@ use crate::handlers::AppState;
 
 #[derive(Debug, Clone)]
 pub struct Movement {
-    /// tire_debit | tire_credit | oil_debit | oil_credit
+    /// tire_debit | tire_credit | oil_debit | oil_credit | battery_debit | battery_credit
     pub kind: &'static str,
     pub brand: Option<String>,
     pub model: Option<String>,
@@ -34,6 +34,9 @@ pub struct Movement {
     pub work_order_id: Option<Uuid>,
     pub user_id: Option<i64>,
     pub note: Option<String>,
+    /// battery_debit / battery_credit only: the product counted (batteries
+    /// are counted here alone, never mirrored to Falcon).
+    pub battery_product_id: Option<Uuid>,
 }
 
 /// Record a movement and adjust the mirrored on-hand, inside the caller's
@@ -42,8 +45,8 @@ pub struct Movement {
 pub async fn record(tx: &mut Transaction<'_, Postgres>, m: &Movement) -> ApiResult<bool> {
     let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO stock_movements \
-            (kind, brand, model, size, oil_type, qty, liters, work_order_id, ref_id, user_id, note) \
-         VALUES ($1::stock_move_kind,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+            (kind, brand, model, size, oil_type, qty, liters, work_order_id, ref_id, user_id, note, battery_product_id) \
+         VALUES ($1::stock_move_kind,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
          ON CONFLICT (ref_id) WHERE ref_id IS NOT NULL DO NOTHING RETURNING id",
     )
     .bind(m.kind)
@@ -57,6 +60,7 @@ pub async fn record(tx: &mut Transaction<'_, Postgres>, m: &Movement) -> ApiResu
     .bind(m.ref_id)
     .bind(m.user_id)
     .bind(&m.note)
+    .bind(m.battery_product_id)
     .fetch_optional(&mut **tx)
     .await?;
     if inserted.is_none() {
@@ -64,7 +68,9 @@ pub async fn record(tx: &mut Transaction<'_, Postgres>, m: &Movement) -> ApiResu
     }
 
     let sign = if m.kind.ends_with("_credit") { 1 } else { -1 };
-    if m.kind.starts_with("tire_") {
+    if m.kind.starts_with("battery_") {
+        // Counted by v_battery_stock straight from the ledger: no mirror.
+    } else if m.kind.starts_with("tire_") {
         if let Some(brand) = m.brand.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
             // Upsert: a debit against a line the mirror has not seen yet must
             // still show (as a negative), not vanish.
@@ -116,6 +122,7 @@ pub async fn mirror_backlog(state: &AppState, token: &str) {
     let rows: Vec<(Uuid, serde_json::Value)> = match sqlx::query_as(
         "SELECT id, to_jsonb(m) FROM stock_movements m \
           WHERE mirrored_to_falcon_at IS NULL AND mirror_error IS NULL AND ref_id IS NOT NULL \
+            AND kind::text NOT LIKE 'battery\\_%' \
           ORDER BY created_at ASC, id ASC LIMIT 200",
     )
     .fetch_all(&state.pool)

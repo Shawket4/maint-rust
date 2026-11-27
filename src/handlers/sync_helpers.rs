@@ -63,6 +63,17 @@ pub fn writable_columns(entity: EntityType) -> &'static [&'static str] {
         EntityType::AttendanceDays => &[
             "id", "worker_id", "work_date", "status", "check_in_at", "check_out_at", "note",
         ],
+        EntityType::BatteryLayouts => &["vehicle_id", "slots"],
+        EntityType::Batteries => &[
+            "id", "brand", "model", "capacity_ah", "voltage", "cca",
+            "serial", "date_code", "warranty_months", "status", "origin", "notes_ar",
+        ],
+        EntityType::BatteryInstalls => &[
+            "id", "battery_id", "vehicle_id", "slot", "work_order_id",
+            "installed_at", "installed_odometer",
+            "removed_at", "removed_odometer", "removal_reason", "removal_outcome",
+            "removal_work_order_id", "notes",
+        ],
     }
 }
 
@@ -85,6 +96,10 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (EntityType::ChassisPositions, "side") => "::position_side",
         (EntityType::ChassisPositions, "depth") => "::position_depth",
         (EntityType::AttendanceDays, "status") => "::attendance_status",
+        (EntityType::Batteries, "status") => "::battery_status",
+        (EntityType::Batteries, "origin") => "::battery_origin",
+        (EntityType::BatteryInstalls, "removal_reason") => "::battery_removal_reason",
+        (EntityType::BatteryInstalls, "removal_outcome") => "::battery_status",
         // UUID-typed PKs and FKs need an explicit cast when extracted via ->>
         (_, "id") if entity.pk_column() == "id" => "::uuid",
         (_, "work_order_id") => "::uuid",
@@ -95,6 +110,8 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (_, "layout_id") => "::uuid",
         (_, "axle_id") => "::uuid",
         (_, "worker_id") => "::uuid",
+        (_, "battery_id") => "::uuid",
+        (_, "removal_work_order_id") => "::uuid",
         // Dates
         (_, "work_date") | (_, "joined_on") | (_, "left_on") => "::date",
         // Integer columns
@@ -102,14 +119,17 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (_, "total_km") | (_, "section_index") | (_, "spare_index") |
         (_, "sort_order") | (_, "mounted_odometer") | (_, "dismounted_odometer") |
         (_, "retread_count") | (_, "superseded_km") |
-        (_, "falcon_employee_id") => "::integer",
+        (_, "falcon_employee_id") | (_, "slot") | (_, "slots") |
+        (_, "capacity_ah") | (_, "voltage") | (_, "cca") | (_, "warranty_months") |
+        (_, "installed_odometer") | (_, "removed_odometer") => "::integer",
         // Numeric/Decimal columns
         (_, "liters") => "::numeric",
         // Timestamptz columns
         (_, "set_at") | (_, "performed_at") | (_, "occurred_at") |
         (_, "opened_at") | (_, "closed_at") |
         (_, "mounted_at") | (_, "dismounted_at") | (_, "done_at") |
-        (_, "check_in_at") | (_, "check_out_at") => "::timestamptz",
+        (_, "check_in_at") | (_, "check_out_at") |
+        (_, "installed_at") | (_, "removed_at") => "::timestamptz",
         // Boolean columns
         (_, "is_done") | (_, "is_steering") | (_, "is_lifted") |
         (_, "is_spare") | (_, "flagged") => "::boolean",

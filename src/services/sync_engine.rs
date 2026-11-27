@@ -46,6 +46,9 @@ pub enum EntityType {
     VehicleOdometerOverrides,
     AttendanceWorkers,
     AttendanceDays,
+    BatteryLayouts,
+    Batteries,
+    BatteryInstalls,
 }
 
 impl EntityType {
@@ -64,12 +67,15 @@ impl EntityType {
             Self::VehicleOdometerOverrides => "vehicle_odometer_overrides",
             Self::AttendanceWorkers => "attendance_workers",
             Self::AttendanceDays => "attendance_days",
+            Self::BatteryLayouts => "battery_layouts",
+            Self::Batteries => "batteries",
+            Self::BatteryInstalls => "battery_installs",
         }
     }
 
     pub fn pk_column(self) -> &'static str {
         match self {
-            Self::VehicleClassAssignments | Self::VehicleOdometerOverrides => "vehicle_id",
+            Self::VehicleClassAssignments | Self::VehicleOdometerOverrides | Self::BatteryLayouts => "vehicle_id",
             _ => "id",
         }
     }
@@ -87,7 +93,7 @@ impl EntityType {
 
     /// Integer-keyed singletons (one row per vehicle): an insert upserts.
     pub fn is_singleton(self) -> bool {
-        matches!(self, Self::VehicleClassAssignments | Self::VehicleOdometerOverrides)
+        matches!(self, Self::VehicleClassAssignments | Self::VehicleOdometerOverrides | Self::BatteryLayouts)
     }
 
     /// Every owned table soft-deletes except the odometer override.
