@@ -56,6 +56,16 @@ pub fn writable_columns(entity: EntityType) -> &'static [&'static str] {
         EntityType::VehicleOdometerOverrides => &[
             "vehicle_id", "odometer", "set_at", "notes", "superseded_km",
         ],
+        EntityType::AttendanceWorkers => &[
+            "id", "name", "job", "phone", "falcon_employee_id",
+            "joined_on", "left_on", "sort_order", "notes",
+        ],
+        EntityType::AttendanceDays => &[
+            "id", "worker_id", "work_date", "status", "check_in_at", "check_out_at", "note",
+        ],
+        EntityType::AttendanceSettings => &[
+            "id", "work_start", "work_end", "late_grace_minutes", "weekly_off_days",
+        ],
     }
 }
 
@@ -77,6 +87,9 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (EntityType::ChassisAxles, "axle_type") => "::axle_type",
         (EntityType::ChassisPositions, "side") => "::position_side",
         (EntityType::ChassisPositions, "depth") => "::position_depth",
+        (EntityType::AttendanceDays, "status") => "::attendance_status",
+        // The settings row is keyed by an integer, not a UUID.
+        (EntityType::AttendanceSettings, "id") => "::integer",
         // UUID-typed PKs and FKs need an explicit cast when extracted via ->>
         (_, "id") if entity.pk_column() == "id" => "::uuid",
         (_, "work_order_id") => "::uuid",
@@ -86,17 +99,22 @@ fn pg_cast(entity: EntityType, col: &str) -> &'static str {
         (_, "position_id") => "::uuid",
         (_, "layout_id") => "::uuid",
         (_, "axle_id") => "::uuid",
+        (_, "worker_id") => "::uuid",
+        // Dates
+        (_, "work_date") | (_, "joined_on") | (_, "left_on") => "::date",
         // Integer columns
         (_, "vehicle_id") | (_, "odometer") | (_, "odometer_at_open") |
         (_, "total_km") | (_, "section_index") | (_, "spare_index") |
         (_, "sort_order") | (_, "mounted_odometer") | (_, "dismounted_odometer") |
-        (_, "retread_count") | (_, "superseded_km") => "::integer",
+        (_, "retread_count") | (_, "superseded_km") |
+        (_, "falcon_employee_id") | (_, "late_grace_minutes") => "::integer",
         // Numeric/Decimal columns
         (_, "liters") => "::numeric",
         // Timestamptz columns
         (_, "set_at") | (_, "performed_at") | (_, "occurred_at") |
         (_, "opened_at") | (_, "closed_at") |
-        (_, "mounted_at") | (_, "dismounted_at") | (_, "done_at") => "::timestamptz",
+        (_, "mounted_at") | (_, "dismounted_at") | (_, "done_at") |
+        (_, "check_in_at") | (_, "check_out_at") => "::timestamptz",
         // Boolean columns
         (_, "is_done") | (_, "is_steering") | (_, "is_lifted") |
         (_, "is_spare") | (_, "flagged") => "::boolean",
@@ -146,10 +164,11 @@ pub async fn insert_from_payload(
         "INSERT INTO {table} ({cols_sql}) VALUES ({vals_sql})"
     );
     if entity.is_singleton() {
-        q.push_str(" ON CONFLICT (vehicle_id) DO UPDATE SET ");
+        let pk = entity.pk_column();
+        q.push_str(&format!(" ON CONFLICT ({pk}) DO UPDATE SET "));
         let mut updates = Vec::new();
         for col in col_list.iter() {
-            if *col == "vehicle_id" { continue; }
+            if *col == pk { continue; }
             updates.push(format!("{col} = EXCLUDED.{col}"));
         }
         updates.push("updated_at = now()".to_string());

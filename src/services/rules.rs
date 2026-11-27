@@ -80,7 +80,17 @@ const ODOMETER_COLS: &[&str] =
     &["odometer", "odometer_at_open", "mounted_odometer", "dismounted_odometer", "superseded_km", "total_km"];
 const TIMESTAMP_COLS: &[&str] = &[
     "set_at", "performed_at", "occurred_at", "opened_at", "closed_at", "mounted_at", "dismounted_at", "done_at",
+    "check_in_at", "check_out_at",
 ];
+
+/// Namespace of attendance day ids: a day's id is the UUID v5 of
+/// "<worker_id>:<YYYY-MM-DD>" in it. The garage app holds the same constant.
+pub const ATTENDANCE_DAY_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x510d161b_3155_4560_9a62_cd726bbed9e9);
+
+/// The one id a worker's day may have.
+pub fn attendance_day_id(worker_id: &uuid::Uuid, work_date: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&ATTENDANCE_DAY_NAMESPACE, format!("{worker_id}:{work_date}").as_bytes())
+}
 
 /// Validate and rewrite a payload in place. `row_before` is the stored row on
 /// an update. Returns a human-readable reason on rejection.
@@ -140,7 +150,71 @@ pub fn normalize(
                 return Err("a status event cannot mount a tire".into());
             }
         }
+        EntityType::AttendanceWorkers => normalize_worker(obj, is_insert)?,
+        EntityType::AttendanceDays => normalize_attendance_day(obj, row_before, is_insert)?,
         _ => {}
+    }
+    Ok(())
+}
+
+/// A worker needs a name; everything else is optional.
+fn normalize_worker(obj: &mut Map<String, Value>, is_insert: bool) -> Result<(), String> {
+    match obj.get("name") {
+        Some(Value::String(n)) => {
+            let n = n.trim().to_string();
+            if n.is_empty() {
+                return Err("a worker needs a name".into());
+            }
+            obj.insert("name".into(), Value::String(n));
+        }
+        Some(_) => return Err("a worker needs a name".into()),
+        None if is_insert => return Err("a worker needs a name".into()),
+        None => {}
+    }
+    for k in ["job", "phone", "notes"] {
+        if let Some(Value::String(v)) = obj.get(k) {
+            let t = v.trim();
+            let v = if t.is_empty() { Value::Null } else { Value::String(t.to_string()) };
+            obj.insert(k.into(), v);
+        }
+    }
+    Ok(())
+}
+
+/// One row per worker per day, under the one id that day may have. The
+/// worker and the date never change after the row exists. Only a present day
+/// keeps its times.
+fn normalize_attendance_day(
+    obj: &mut Map<String, Value>,
+    row_before: Option<&Value>,
+    is_insert: bool,
+) -> Result<(), String> {
+    if is_insert {
+        let worker = obj
+            .get("worker_id")
+            .and_then(Value::as_str)
+            .and_then(|w| uuid::Uuid::parse_str(w).ok())
+            .ok_or("worker_id is required")?;
+        let date = obj.get("work_date").and_then(Value::as_str).ok_or("work_date is required")?;
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| "work_date must be YYYY-MM-DD")?;
+        let id = obj.get("id").and_then(Value::as_str).and_then(|i| uuid::Uuid::parse_str(i).ok());
+        if id != Some(attendance_day_id(&worker, date)) {
+            return Err("an attendance day must use its worker-and-date id".into());
+        }
+    } else if let Some(before) = row_before {
+        for k in ["worker_id", "work_date"] {
+            if let Some(v) = obj.get(k) {
+                if before.get(k) != Some(v) {
+                    return Err(format!("{k} of an attendance day cannot change"));
+                }
+            }
+        }
+    }
+    if let Some(status) = obj.get("status").and_then(Value::as_str) {
+        if status != "present" {
+            obj.insert("check_in_at".into(), Value::Null);
+            obj.insert("check_out_at".into(), Value::Null);
+        }
     }
     Ok(())
 }

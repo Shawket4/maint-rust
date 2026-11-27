@@ -77,6 +77,8 @@ like Falcon's.
 | `POST /sync/push`, `GET /sync/pull` | The sync protocol, below. |
 | `GET /records/{entity_type}/{id}` | One synced row and its `sync_version`. |
 | `GET /cache/vehicles` | Fleet list from Falcon; also refreshes `vehicles_cache`. |
+| `GET /cache/employees` | Falcon's employees (id, name, type, active only), for the garage's attendance list. Falcon lists them at permission 3; below that the answer is empty with `available: false`. |
+| `GET /office/attendance?month=YYYY-MM` | The garage's attendance for one month (Cairo calendar): settings, days, one cell per worker per day, totals. |
 | `GET /cache/service-invoices`, `…/search` | Paged proxy to Falcon. |
 | `GET /vehicles/{id}/service-events` | A vehicle's service history (needs `FALCON_DATABASE_URL`). |
 | `GET /categories`, `/vehicle-classes`, `/vehicle-class-assignments`, `/vehicles` | Reference data. |
