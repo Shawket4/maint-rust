@@ -113,6 +113,29 @@ pub async fn before_insert(
             payload["from_status"] = Value::String(status);
             Ok(None)
         }
+        EntityType::BatteryInstalls => {
+            let Some(battery_id) = uuid_at(payload, "battery_id") else {
+                return Ok(Some((codes::VALIDATION, "battery_id is required".into())));
+            };
+            if let Some(reject) = live_work_order(tx, payload, "work_order_id").await? {
+                return Ok(Some(reject));
+            }
+            let battery: Option<(String, bool)> =
+                sqlx::query_as("SELECT status::text, deleted_at IS NOT NULL FROM batteries WHERE id = $1 FOR UPDATE")
+                    .bind(battery_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            let Some((status, deleted)) = battery else {
+                return Ok(Some((codes::MISSING_REFERENCE, "the battery does not exist on the server".into())));
+            };
+            if payload.get("removed_at").map(Value::is_null).unwrap_or(true) && (deleted || status != "in_stock_used") {
+                return Ok(Some((
+                    codes::BATTERY_NOT_AVAILABLE,
+                    format!("the battery is not available to fit (it is {status})"),
+                )));
+            }
+            Ok(None)
+        }
         EntityType::WorkOrderTasks | EntityType::OilChanges => {
             // A child of a deleted work order would be invisible everywhere.
             if let Some(wo) = uuid_at(payload, "work_order_id") {
@@ -136,24 +159,35 @@ pub async fn before_insert(
 }
 
 pub async fn before_update(
-    _tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction<'_, Postgres>,
     entity: EntityType,
     _entity_id: &str,
     payload: &Value,
     row_before: &Value,
 ) -> ApiResult<Reject> {
-    if entity == EntityType::TireAssignments {
+    if entity == EntityType::Batteries && payload.get("status").is_some() {
+        if let Some(id) = row_before.get("id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) {
+            if battery_fitted(tx, id).await? {
+                return Ok(Some((codes::BATTERY_INSTALLED, "the battery is fitted; take it off first".into())));
+            }
+        }
+    }
+    let immutable: &[&str] = match entity {
         // An assignment is a fact about one tire on one position. Moving it is
-        // a dismount + a mount, never an edit.
-        for k in ["tire_id", "position_id", "vehicle_id"] {
-            if let Some(sent) = payload.get(k) {
-                let same = match (sent, row_before.get(k)) {
-                    (a, Some(b)) => a.to_string().trim_matches('"').eq_ignore_ascii_case(b.to_string().trim_matches('"')),
-                    _ => false,
-                };
-                if !same {
-                    return Ok(Some((codes::VALIDATION, format!("{k} of a mount cannot be changed"))));
-                }
+        // a dismount + a mount, never an edit. The same for a battery in a slot.
+        EntityType::TireAssignments => &["tire_id", "position_id", "vehicle_id"],
+        EntityType::BatteryInstalls => &["battery_id", "vehicle_id", "slot"],
+        _ => &[],
+    };
+    for &k in immutable {
+        if let Some(sent) = payload.get(k) {
+            let same = match (sent, row_before.get(k)) {
+                (a, Some(b)) => a.to_string().trim_matches('"').eq_ignore_ascii_case(b.to_string().trim_matches('"')),
+                _ => false,
+            };
+            if !same {
+                let what = if entity == EntityType::BatteryInstalls { "a fitted battery" } else { "a mount" };
+                return Ok(Some((codes::VALIDATION, format!("{k} of {what} cannot be changed"))));
             }
         }
     }
@@ -180,13 +214,20 @@ pub async fn before_delete(
                 return Ok(Some((codes::TIRE_MOUNTED, "the tire is mounted; dismount it first".into())));
             }
         }
+        EntityType::Batteries => {
+            if battery_fitted(tx, id).await? {
+                return Ok(Some((codes::BATTERY_INSTALLED, "the battery is fitted; take it off first".into())));
+            }
+        }
         EntityType::WorkOrders => {
-            // Tasks go with the work order; recorded tire work and oil do not
-            // — they changed stock and tire state and must be undone first.
+            // Tasks go with the work order; recorded tire, battery and oil
+            // work does not — it changed stock and must be undone first.
             let (busy,): (bool,) = sqlx::query_as(
                 "SELECT EXISTS (SELECT 1 FROM oil_changes WHERE work_order_id = $1 AND deleted_at IS NULL) \
                      OR EXISTS (SELECT 1 FROM tire_assignments \
-                                 WHERE (work_order_id = $1 OR dismount_work_order_id = $1) AND deleted_at IS NULL)",
+                                 WHERE (work_order_id = $1 OR dismount_work_order_id = $1) AND deleted_at IS NULL) \
+                     OR EXISTS (SELECT 1 FROM battery_installs \
+                                 WHERE (work_order_id = $1 OR removal_work_order_id = $1) AND deleted_at IS NULL)",
             )
             .bind(id)
             .fetch_one(&mut **tx)
@@ -194,7 +235,7 @@ pub async fn before_delete(
             if busy {
                 return Ok(Some((
                     codes::WORK_ORDER_NOT_EMPTY,
-                    "the work order has tire or oil work recorded; remove that first".into(),
+                    "the work order has tire, battery or oil work recorded; remove that first".into(),
                 )));
             }
         }
@@ -233,6 +274,32 @@ pub async fn before_delete(
         _ => {}
     }
     Ok(None)
+}
+
+/// A work order a row hangs off must exist and be live.
+async fn live_work_order(tx: &mut Transaction<'_, Postgres>, payload: &Value, key: &str) -> ApiResult<Reject> {
+    let Some(wo) = uuid_at(payload, key) else { return Ok(None) };
+    let deleted: Option<(bool,)> = sqlx::query_as("SELECT deleted_at IS NOT NULL FROM work_orders WHERE id = $1")
+        .bind(wo)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(match deleted {
+        None => Some((codes::MISSING_REFERENCE, "the work order does not exist on the server".into())),
+        Some((true,)) => Some((codes::DELETED, "the work order was deleted".into())),
+        _ => None,
+    })
+}
+
+/// Is the battery in a slot right now?
+async fn battery_fitted(tx: &mut Transaction<'_, Postgres>, battery_id: Uuid) -> ApiResult<bool> {
+    let (fitted,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM battery_installs \
+          WHERE battery_id = $1 AND removed_at IS NULL AND deleted_at IS NULL)",
+    )
+    .bind(battery_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(fitted)
 }
 
 // ═══════════════════════════ derivations ════════════════════════════════════
@@ -291,6 +358,85 @@ async fn set_tire_status(tx: &mut Transaction<'_, Postgres>, tire_id: Uuid, stat
     Ok(())
 }
 
+/// The one rule for `batteries.status`, as for tires:
+///   * an open install ⇒ installed;
+///   * otherwise a battery still marked installed takes the outcome of its
+///     last removal (no install left at all: back in stock as used);
+///   * otherwise it keeps what it was given by hand.
+pub async fn rederive_battery_status(tx: &mut Transaction<'_, Postgres>, battery_id: Uuid) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+        WITH want AS (
+            SELECT CASE
+                     WHEN EXISTS (SELECT 1 FROM battery_installs
+                                   WHERE battery_id = $1 AND removed_at IS NULL AND deleted_at IS NULL) THEN 'installed'
+                     WHEN b.status = 'installed' THEN
+                       COALESCE((SELECT removal_outcome::text FROM battery_installs
+                                  WHERE battery_id = $1 AND removed_at IS NOT NULL AND deleted_at IS NULL
+                                  ORDER BY removed_at DESC, id LIMIT 1), 'in_stock_used')
+                     ELSE b.status::text
+                   END AS status
+              FROM batteries b WHERE b.id = $1
+        )
+        UPDATE batteries b
+           SET status = want.status::battery_status, sync_version = b.sync_version + 1
+          FROM want
+         WHERE b.id = $1 AND b.status::text <> want.status
+        "#,
+    )
+    .bind(battery_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn set_battery_status(tx: &mut Transaction<'_, Postgres>, battery_id: Uuid, status: &str) -> ApiResult<()> {
+    sqlx::query(
+        "UPDATE batteries SET status = $2::battery_status, sync_version = sync_version + 1 \
+          WHERE id = $1 AND status::text <> $2",
+    )
+    .bind(battery_id)
+    .bind(status)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// One unit of the battery's product, in or out of the shelf count. The spec
+/// rides in `size` ("100Ah 12V") so movement lists read without a join.
+async fn battery_movement(
+    tx: &mut Transaction<'_, Postgres>,
+    kind: &'static str,
+    battery_id: Uuid,
+    ref_id: Uuid,
+    user_id: i64,
+    note: &str,
+) -> ApiResult<Option<Movement>> {
+    let row: Option<(Option<Uuid>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT b.battery_product_id, b.brand, b.model, \
+                NULLIF(concat_ws(' ', b.capacity_ah::text || 'Ah', b.voltage::text || 'V'), '') \
+           FROM batteries b WHERE b.id = $1",
+    )
+    .bind(battery_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((product, brand, model, spec)) = row else { return Ok(None) };
+    Ok(Some(Movement {
+        kind,
+        brand: Some(brand),
+        model,
+        size: spec,
+        oil_type: None,
+        qty: Some(1),
+        liters: None,
+        ref_id,
+        work_order_id: None,
+        user_id: Some(user_id),
+        note: Some(note.to_string()),
+        battery_product_id: product,
+    }))
+}
+
 fn oil_movement(kind: &'static str, row: &Value, ref_id: Uuid, user_id: i64, note: &str) -> Option<Movement> {
     let liters = row.get("liters").and_then(rules::as_f64)?;
     Some(Movement {
@@ -305,6 +451,7 @@ fn oil_movement(kind: &'static str, row: &Value, ref_id: Uuid, user_id: i64, not
         work_order_id: uuid_at(row, "work_order_id"),
         user_id: Some(user_id),
         note: Some(note.to_string()),
+        battery_product_id: None,
     })
 }
 
@@ -321,6 +468,7 @@ fn tire_movement(kind: &'static str, row: &Value, ref_id: Uuid, user_id: i64, no
         work_order_id: None,
         user_id: Some(user_id),
         note: Some(note.to_string()),
+        battery_product_id: None,
     }
 }
 
@@ -437,6 +585,58 @@ pub async fn after_apply(
                     .execute(&mut **tx)
                     .await?;
                 }
+            }
+        }
+
+        // ── batteries: one from stock is one unit off the shelf count ───────
+        (EntityType::Batteries, SyncOperation::Insert) => {
+            if let (Some(id), Some("stock")) = (id, str_at(payload, "origin")) {
+                if let Some(m) = battery_movement(tx, "battery_debit", id, id, user_id, "new battery fitted").await? {
+                    moved |= stock_ledger::record(tx, &m).await?;
+                }
+            }
+        }
+        (EntityType::Batteries, SyncOperation::Delete) => {
+            if let (Some(id), Some(before)) = (id, row_before) {
+                if str_at(before, "origin") == Some("stock") {
+                    let ref_id = derived_ref(id, "delete-credit");
+                    if let Some(m) = battery_movement(tx, "battery_credit", id, ref_id, user_id, "battery record removed").await? {
+                        moved |= stock_ledger::record(tx, &m).await?;
+                    }
+                }
+            }
+        }
+
+        // ── battery installs drive battery status ───────────────────────────
+        (EntityType::BatteryInstalls, SyncOperation::Insert) => {
+            if let Some(battery_id) = uuid_at(payload, "battery_id") {
+                if payload.get("removed_at").map(Value::is_null).unwrap_or(true) {
+                    set_battery_status(tx, battery_id, "installed").await?;
+                } else {
+                    rederive_battery_status(tx, battery_id).await?;
+                }
+            }
+        }
+        (EntityType::BatteryInstalls, SyncOperation::Update) => {
+            let Some(before) = row_before else { return Ok(false) };
+            if let Some(battery_id) = uuid_at(before, "battery_id") {
+                let was_open = before.get("removed_at").map(Value::is_null).unwrap_or(true);
+                let now_open = match payload.get("removed_at") {
+                    Some(v) => v.is_null(),
+                    None => was_open,
+                };
+                if was_open && !now_open {
+                    let outcome = str_at(payload, "removal_outcome").unwrap_or("in_stock_used");
+                    set_battery_status(tx, battery_id, outcome).await?;
+                } else if !was_open && now_open {
+                    set_battery_status(tx, battery_id, "installed").await?;
+                }
+                rederive_battery_status(tx, battery_id).await?;
+            }
+        }
+        (EntityType::BatteryInstalls, SyncOperation::Delete) => {
+            if let Some(battery_id) = row_before.and_then(|r| uuid_at(r, "battery_id")) {
+                rederive_battery_status(tx, battery_id).await?;
             }
         }
 

@@ -63,7 +63,18 @@ async fn catalog(pool: web::Data<PgPool>) -> ApiResult<HttpResponse> {
     )
     .fetch_one(pool.get_ref())
     .await?;
-    Ok(HttpResponse::Ok().json(json!({ "tire_products": tires, "oil_products": oil, "standard_jobs": jobs })))
+    let (batteries,): (Value,) = sqlx::query_as(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'id', s.id, 'brand', s.brand, 'model', s.model, 'capacity_ah', s.capacity_ah,
+                    'voltage', s.voltage, 'cca', s.cca, 'batteries', s.batteries, 'on_hand', s.on_hand_qty)
+                  ORDER BY s.brand, s.model, s.capacity_ah NULLS LAST, s.voltage NULLS LAST), '[]'::jsonb)
+           FROM v_battery_stock s",
+    )
+    .fetch_one(pool.get_ref())
+    .await?;
+    Ok(HttpResponse::Ok().json(json!({
+        "tire_products": tires, "oil_products": oil, "standard_jobs": jobs, "battery_products": batteries,
+    })))
 }
 
 #[derive(Debug, Deserialize)]

@@ -33,6 +33,10 @@ pub mod codes {
     pub const WORK_ORDER_NOT_EMPTY: &str = "work_order_not_empty";
     pub const DUPLICATE: &str = "duplicate";
     pub const WORKER_HAS_DAYS: &str = "worker_has_days";
+    pub const BATTERY_NOT_AVAILABLE: &str = "battery_not_available";
+    pub const BATTERY_INSTALLED: &str = "battery_installed";
+    pub const BATTERY_ALREADY_INSTALLED: &str = "battery_already_installed";
+    pub const SLOT_OCCUPIED: &str = "slot_occupied";
 }
 
 pub const OIL_FLAG_MIN: f64 = 34.0;
@@ -78,10 +82,11 @@ fn as_i64(v: &Value) -> Option<i64> {
 }
 
 const ODOMETER_COLS: &[&str] =
-    &["odometer", "odometer_at_open", "mounted_odometer", "dismounted_odometer", "superseded_km", "total_km"];
+    &["odometer", "odometer_at_open", "mounted_odometer", "dismounted_odometer", "superseded_km", "total_km",
+      "installed_odometer", "removed_odometer"];
 const TIMESTAMP_COLS: &[&str] = &[
     "set_at", "performed_at", "occurred_at", "opened_at", "closed_at", "mounted_at", "dismounted_at", "done_at",
-    "check_in_at", "check_out_at",
+    "check_in_at", "check_out_at", "installed_at", "removed_at",
 ];
 
 /// Namespace of attendance day ids: a day's id is the UUID v5 of
@@ -156,6 +161,18 @@ pub fn normalize(
         }
         EntityType::AttendanceWorkers => normalize_worker(obj, is_insert)?,
         EntityType::AttendanceDays => normalize_attendance_day(obj, row_before, is_insert)?,
+        EntityType::Batteries => normalize_battery(obj, is_insert)?,
+        EntityType::BatteryInstalls => normalize_battery_install(obj, row_before)?,
+        EntityType::BatteryLayouts => {
+            if let Some(v) = obj.get("slots") {
+                match as_i64(v) {
+                    Some(n) if (1..=12).contains(&n) => {
+                        obj.insert("slots".into(), Value::from(n));
+                    }
+                    _ => return Err("slots must be between 1 and 12".into()),
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -295,6 +312,113 @@ fn normalize_tire(obj: &mut Map<String, Value>, is_insert: bool) -> Result<(), S
     Ok(())
 }
 
+/// Where a battery goes when it comes off a truck (also every status a garage
+/// app may set by hand): 'installed' belongs to the install ledger.
+pub const BATTERY_OFF_STATUSES: &[&str] = &["in_stock_used", "charging", "warranty", "scrapped"];
+
+fn bounded_int(obj: &mut Map<String, Value>, key: &str, lo: i64, hi: i64) -> Result<(), String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) if s.trim().is_empty() => {
+            obj.insert(key.into(), Value::Null);
+            Ok(())
+        }
+        Some(v) => match as_i64(v) {
+            Some(n) if (lo..=hi).contains(&n) => {
+                obj.insert(key.into(), Value::from(n));
+                Ok(())
+            }
+            _ => Err(format!("{key} must be between {lo} and {hi}")),
+        },
+    }
+}
+
+/// A battery's `status` is set by its installs; by hand only to an off-truck
+/// status (charging done → back in stock, a warranty claim, scrap). Its origin
+/// is fixed at birth: it decides whether it came off the shelf count.
+fn normalize_battery(obj: &mut Map<String, Value>, is_insert: bool) -> Result<(), String> {
+    if is_insert {
+        let status = match obj.get("status").and_then(Value::as_str) {
+            Some(s) if BATTERY_OFF_STATUSES.contains(&s) => s.to_string(),
+            _ => "in_stock_used".to_string(),
+        };
+        obj.insert("status".into(), Value::String(status));
+        match obj.get("origin").and_then(Value::as_str) {
+            Some("stock" | "legacy") => {}
+            _ => return Err("origin must be 'stock' or 'legacy'".into()),
+        }
+    } else {
+        obj.remove("origin");
+        match obj.get("status").and_then(Value::as_str) {
+            None => {
+                obj.remove("status");
+            }
+            Some(s) if BATTERY_OFF_STATUSES.contains(&s) => {}
+            Some(_) => return Err("status must be one of in_stock_used, charging, warranty, scrapped".into()),
+        }
+    }
+    if let Some(v) = obj.get("brand") {
+        let b = v.as_str().map(str::trim).unwrap_or("");
+        if b.is_empty() {
+            return Err("brand is required".into());
+        }
+        obj.insert("brand".into(), Value::String(b.to_string()));
+    } else if is_insert {
+        return Err("brand is required".into());
+    }
+    for k in ["model", "serial", "date_code", "notes_ar"] {
+        if let Some(Value::String(s)) = obj.get(k) {
+            let t = s.trim().to_string();
+            obj.insert(k.into(), if t.is_empty() { Value::Null } else { Value::String(t) });
+        }
+    }
+    bounded_int(obj, "capacity_ah", 1, 2000)?;
+    bounded_int(obj, "voltage", 2, 48)?;
+    bounded_int(obj, "cca", 1, 5000)?;
+    bounded_int(obj, "warranty_months", 0, 120)?;
+    Ok(())
+}
+
+/// A removal says where the battery went (default: back to stock as used)
+/// and why (default: other); the km at removal is not below the km at fitting.
+fn normalize_battery_install(obj: &mut Map<String, Value>, row_before: Option<&Value>) -> Result<(), String> {
+    bounded_int(obj, "slot", 1, 12)?;
+    let removed = match obj.get("removed_at") {
+        Some(v) => !v.is_null(),
+        None => row_before.and_then(|r| r.get("removed_at")).map(|v| !v.is_null()).unwrap_or(false),
+    };
+    if let Some(Value::String(o)) = obj.get("removal_outcome") {
+        if !BATTERY_OFF_STATUSES.contains(&o.as_str()) {
+            return Err("removal_outcome must be one of in_stock_used, charging, warranty, scrapped".into());
+        }
+    }
+    if removed {
+        let before_has = |k: &str| row_before.and_then(|r| r.get(k)).map(|v| !v.is_null()).unwrap_or(false);
+        if obj.get("removal_outcome").map(Value::is_null).unwrap_or(!before_has("removal_outcome")) {
+            obj.insert("removal_outcome".into(), Value::String("in_stock_used".into()));
+        }
+        if obj.get("removal_reason").map(Value::is_null).unwrap_or(!before_has("removal_reason")) {
+            obj.insert("removal_reason".into(), Value::String("other".into()));
+        }
+    } else if obj.contains_key("removed_at") {
+        // Taken back (an undone removal): nothing about a removal stays.
+        for k in ["removed_odometer", "removal_reason", "removal_outcome", "removal_work_order_id"] {
+            obj.insert(k.into(), Value::Null);
+        }
+    }
+    let km = |k: &str| {
+        obj.get(k)
+            .or_else(|| row_before.and_then(|r| r.get(k)))
+            .and_then(as_i64)
+    };
+    if let (Some(a), Some(b)) = (km("installed_odometer"), km("removed_odometer")) {
+        if b < a {
+            return Err("removed_odometer is below installed_odometer".into());
+        }
+    }
+    Ok(())
+}
+
 /// status and closed_at say the same thing; keep them saying it.
 fn normalize_work_order(obj: &mut Map<String, Value>, row_before: Option<&Value>, now: DateTime<Utc>) {
     let status = obj
@@ -394,6 +518,8 @@ pub fn explain_db_error(e: &sqlx::Error) -> (&'static str, String) {
         "23505" => match constraint {
             "uq_active_position" => (codes::POSITION_OCCUPIED, "that wheel position already has a tire".into()),
             "uq_active_tire" => (codes::TIRE_ALREADY_MOUNTED, "that tire is already mounted".into()),
+            "uq_active_battery_slot" => (codes::SLOT_OCCUPIED, "that battery slot already has a battery".into()),
+            "uq_active_battery" => (codes::BATTERY_ALREADY_INSTALLED, "that battery is already fitted".into()),
             "uq_chassis_layouts_vehicle_live" => {
                 (codes::CHASSIS_EXISTS, "this vehicle already has a chassis layout".into())
             }

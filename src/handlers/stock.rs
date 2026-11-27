@@ -208,6 +208,7 @@ async fn credit_tires(
             work_order_id: None,
             user_id: Some(claims.user_id),
             note: clean(b.note.as_deref(), "note")?,
+            battery_product_id: None,
         },
     )
     .await?;
@@ -267,6 +268,7 @@ async fn credit_oil(
             work_order_id: None,
             user_id: Some(claims.user_id),
             note: clean(b.note.as_deref(), "note")?,
+            battery_product_id: None,
         },
     )
     .await?;
@@ -347,6 +349,7 @@ async fn count_tires(
                 work_order_id: None,
                 user_id: Some(claims.user_id),
                 note,
+                battery_product_id: None,
             },
         )
         .await?;
@@ -414,6 +417,7 @@ async fn count_oil(
                 work_order_id: None,
                 user_id: Some(claims.user_id),
                 note,
+                battery_product_id: None,
             },
         )
         .await?;
@@ -432,6 +436,182 @@ async fn count_oil(
 /// The in/out ledger: every recorded stock movement (debits from oil changes
 /// and shipment-tire mounts, credits from the dashboard), newest first, with
 /// the consuming work order's plate resolved. `kind` filters to tire | oil.
+// ── batteries: counted here alone (no Falcon ledger) ─────────────────────────
+
+/// New batteries on the shelf, per product. Products nothing was ever
+/// received for and nothing is left of are left out.
+#[get("/stock/batteries")]
+async fn battery_stock(pool: web::Data<PgPool>, _claims: AuthClaims) -> ApiResult<HttpResponse> {
+    let rows: Vec<(Value,)> = sqlx::query_as(
+        "SELECT to_jsonb(s) FROM v_battery_stock s \
+          WHERE s.on_hand_qty <> 0 OR EXISTS (SELECT 1 FROM stock_movements m WHERE m.battery_product_id = s.id) \
+          ORDER BY s.brand, s.model, s.capacity_ah NULLS LAST, s.voltage NULLS LAST",
+    )
+    .fetch_all(pool.get_ref())
+    .await?;
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Stock-Fresh", "true"))
+        .json(rows.into_iter().map(|(v,)| v).collect::<Vec<_>>()))
+}
+
+/// What identifies a battery product: brand, model, Ah, volts (CCA rides along).
+#[derive(Debug, Deserialize)]
+struct BatterySpec {
+    brand: String,
+    model: Option<String>,
+    capacity_ah: Option<i32>,
+    voltage: Option<i32>,
+    cca: Option<i32>,
+}
+
+impl BatterySpec {
+    fn check(&self) -> ApiResult<(String, Option<String>)> {
+        let brand = clean(Some(&self.brand), "brand")?.ok_or_else(|| ApiError::BadRequest("brand is required".into()))?;
+        let model = clean(self.model.as_deref(), "model")?;
+        let within = |v: Option<i32>, lo: i32, hi: i32, what: &str| match v {
+            Some(n) if !(lo..=hi).contains(&n) => Err(ApiError::BadRequest(format!("{what} must be between {lo} and {hi}"))),
+            _ => Ok(()),
+        };
+        within(self.capacity_ah, 1, 2000, "capacity_ah")?;
+        within(self.voltage, 2, 48, "voltage")?;
+        within(self.cca, 1, 5000, "cca")?;
+        Ok((brand, model))
+    }
+}
+
+/// The product row a spec names (created on first use), locked for the count.
+async fn battery_product(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    spec: &BatterySpec,
+    brand: &str,
+    model: Option<&str>,
+    user_id: i64,
+) -> ApiResult<(uuid::Uuid, Value)> {
+    let (id,): (uuid::Uuid,) = sqlx::query_as("SELECT maint_battery_product($1, $2, $3, $4, $5, $6)")
+        .bind(brand)
+        .bind(model)
+        .bind(spec.capacity_ah)
+        .bind(spec.voltage)
+        .bind(spec.cca)
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7))").bind(id).execute(&mut **tx).await?;
+    let (row,): (Value,) = sqlx::query_as("SELECT to_jsonb(s) FROM v_battery_stock s WHERE s.id = $1")
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok((id, row))
+}
+
+fn battery_move(kind: &'static str, product: uuid::Uuid, row: &Value, qty: i32, ref_id: uuid::Uuid, user_id: i64, note: Option<String>) -> stock_ledger::Movement {
+    let spec = [
+        row.get("capacity_ah").and_then(Value::as_i64).map(|n| format!("{n}Ah")),
+        row.get("voltage").and_then(Value::as_i64).map(|n| format!("{n}V")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    stock_ledger::Movement {
+        kind,
+        brand: row.get("brand").and_then(Value::as_str).map(String::from),
+        model: row.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()).map(String::from),
+        size: Some(spec).filter(|s| !s.is_empty()),
+        oil_type: None,
+        qty: Some(qty),
+        liters: None,
+        ref_id,
+        work_order_id: None,
+        user_id: Some(user_id),
+        note,
+        battery_product_id: Some(product),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BatteryCredit {
+    #[serde(flatten)]
+    spec: BatterySpec,
+    qty: i32,
+    /// Idempotency key — see TireCredit::ref_id.
+    ref_id: Option<String>,
+    note: Option<String>,
+}
+
+#[post("/stock/batteries/credit")]
+async fn credit_batteries(
+    pool: web::Data<PgPool>,
+    claims: AuthClaims,
+    body: web::Json<BatteryCredit>,
+) -> ApiResult<HttpResponse> {
+    claims.require(level::STOCK_CREDIT, "adding stock")?;
+    let b = body.into_inner();
+    if b.qty <= 0 || b.qty > 10_000 {
+        return Err(ApiError::BadRequest("qty must be between 1 and 10000".into()));
+    }
+    let (brand, model) = b.spec.check()?;
+    let note = clean(b.note.as_deref(), "note")?;
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?.unwrap_or_else(uuid::Uuid::new_v4);
+    let mut tx = pool.begin().await?;
+    let (product, row) = battery_product(&mut tx, &b.spec, &brand, model.as_deref(), claims.user_id).await?;
+    stock_ledger::record(&mut tx, &battery_move("battery_credit", product, &row, b.qty, ref_id, claims.user_id, note)).await?;
+    let (after,): (Value,) = sqlx::query_as("SELECT to_jsonb(s) FROM v_battery_stock s WHERE s.id = $1")
+        .bind(product)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(HttpResponse::Ok().json(after))
+}
+
+#[derive(Debug, Deserialize)]
+struct BatteryCount {
+    #[serde(flatten)]
+    spec: BatterySpec,
+    /// How many new ones are on the shelf.
+    counted: i32,
+    ref_id: Option<String>,
+    note: Option<String>,
+}
+
+/// "We counted N" — one movement brings the book to N, marked as a count.
+#[post("/stock/batteries/count")]
+async fn count_batteries(
+    pool: web::Data<PgPool>,
+    claims: AuthClaims,
+    body: web::Json<BatteryCount>,
+) -> ApiResult<HttpResponse> {
+    claims.require(level::STOCK_CREDIT, "correcting stock")?;
+    let b = body.into_inner();
+    if !(0..=100_000).contains(&b.counted) {
+        return Err(ApiError::BadRequest("counted must be between 0 and 100000".into()));
+    }
+    let (brand, model) = b.spec.check()?;
+    let note = clean(b.note.as_deref(), "note")?;
+    let ref_id = parse_opt_uuid(b.ref_id.as_deref())?.unwrap_or_else(uuid::Uuid::new_v4);
+    let mut tx = pool.begin().await?;
+    let (product, row) = battery_product(&mut tx, &b.spec, &brand, model.as_deref(), claims.user_id).await?;
+    let before = row.get("on_hand_qty").and_then(Value::as_i64).unwrap_or(0);
+    let diff = i64::from(b.counted) - before;
+    if diff != 0 {
+        let kind = if diff > 0 { "battery_credit" } else { "battery_debit" };
+        let m = battery_move(kind, product, &row, diff.unsigned_abs() as i32, ref_id, claims.user_id, note);
+        if stock_ledger::record(&mut tx, &m).await? {
+            sqlx::query("UPDATE stock_movements SET is_count = true WHERE ref_id = $1").bind(ref_id).execute(&mut *tx).await?;
+        }
+    }
+    let (after,): (Value,) = sqlx::query_as("SELECT to_jsonb(s) FROM v_battery_stock s WHERE s.id = $1")
+        .bind(product)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let on_hand = after.get("on_hand_qty").and_then(Value::as_i64).unwrap_or(0);
+    let mut out = after;
+    out["before"] = json!(before);
+    out["change"] = json!(on_hand - before);
+    Ok(HttpResponse::Ok().json(out))
+}
+
 #[derive(Debug, Deserialize)]
 struct MovementsQuery {
     kind: Option<String>,
@@ -453,6 +633,7 @@ async fn stock_movements(
     let kind_filter = match q.kind.as_deref() {
         Some("tire") => " AND m.kind IN ('tire_debit','tire_credit')",
         Some("oil") => " AND m.kind IN ('oil_debit','oil_credit')",
+        Some("battery") => " AND m.kind IN ('battery_debit','battery_credit')",
         _ => "",
     };
     // `from` binds as $3 (Option → NULL when absent). A bad timestamp casts to
@@ -521,6 +702,9 @@ async fn dev_seed(state: web::Data<AppState>, pool: web::Data<PgPool>) -> ApiRes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(tire_stock)
         .service(oil_stock)
+        .service(battery_stock)
+        .service(credit_batteries)
+        .service(count_batteries)
         .service(stock_movements)
         .service(credit_tires)
         .service(credit_oil)
