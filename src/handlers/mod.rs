@@ -1,6 +1,8 @@
 pub mod ai;
 pub mod ai_audit;
+pub mod attendance;
 pub mod auth_login;
+pub mod cache_employees;
 pub mod cache_invoices;
 pub mod cache_vehicles;
 pub mod catalog;
@@ -62,10 +64,12 @@ pub fn api_scope(jwt_secret: String) -> impl HttpServiceFactory {
                 .wrap(AiAudit)
                 .wrap(JwtAuth::new(jwt_secret))
                 .configure(cache_vehicles::configure)
+                .configure(cache_employees::configure)
                 .configure(cache_invoices::configure)
                 .configure(reference::configure)
                 .configure(catalog::configure)
                 .configure(office::configure)
+                .configure(attendance::configure)
                 .configure(due::configure)
                 .configure(plans::configure)
                 .configure(stock::configure)

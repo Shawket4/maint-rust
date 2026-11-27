@@ -198,6 +198,20 @@ pub async fn before_delete(
                 )));
             }
         }
+        EntityType::AttendanceWorkers => {
+            // Marked days stay in their months: a worker who left gets a
+            // leaving date, not a delete (another device may have marked days
+            // this one has not seen yet).
+            let (has_days,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM attendance_days WHERE worker_id = $1 AND deleted_at IS NULL)",
+            )
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if has_days {
+                return Ok(Some((codes::WORKER_HAS_DAYS, "this worker has marked days; set the day they left".into())));
+            }
+        }
         EntityType::ChassisPositions | EntityType::ChassisAxles | EntityType::ChassisLayouts => {
             let filter = match entity {
                 EntityType::ChassisPositions => "p.id = $1",

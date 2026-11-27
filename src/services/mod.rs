@@ -1,3 +1,4 @@
+pub mod attendance;
 pub mod legacy_import;
 pub mod rules;
 pub mod side_effects;
